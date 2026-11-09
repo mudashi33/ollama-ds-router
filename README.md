@@ -130,7 +130,7 @@ models:
 - `compat.thinkingFormat: deepseek` 让 DSH 用 `thinking: {type: enabled/disabled}` 开关思考
   （而不是 OpenAI 的 `reasoning_effort`），两家网关都认这一套。
 
-改完 `C:\Users\Administrator\.dsh\profiles\desktop\cordis.patch.yml` 后需要**重启 DSH**才生效。
+改完 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml` 后需要**重启 DSH**才生效。
 
 ### 怎么证明"现在真的是 Max"
 
@@ -256,7 +256,7 @@ node test-local.mjs          # 路由 / 映射 / 回退 / 流式
 
 ## 第三步：接进 DSH
 
-**已经替你加好了。** `C:\Users\Administrator\.dsh\profiles\desktop\cordis.patch.yml`
+**已经替你加好了。** `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`
 里的 `llm-pi-ai` 现在多了一条 `time-router` 路由，原文件备份在同目录
 `cordis.patch.yml.bak-20261105-194302`。
 

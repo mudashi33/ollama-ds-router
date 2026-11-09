@@ -8,7 +8,7 @@
 按北京时间把请求分给 DeepSeek 官方或 Ollama Cloud（两家高峰期错开，自动切到空闲的那家），
 端口 8788，带看板、余额、四模式切换和 Windows 托盘小工具。
 
-源码：GitHub 私有仓库 https://github.com/mudashi33/ollama-ds-router
+源码：GitHub 公开仓库 https://github.com/mudashi33/ollama-ds-router
 仓库里没有 .env（密钥不入库，需要你自己建）；托盘程序 tray\RouterTray.exe 已经编好入库
 （182 KB，x86 静态 CRT，Win7-Win11 免安装），clone 下来双击就能用。
 
@@ -19,8 +19,7 @@
    不要 cat/type/Get-Content 整个 .env。
 4. 不要 npm install、不要 pnpm install —— 这个项目零运行时依赖，只用 Node 内置模块。
 5. 不要改 DSH 的 contextWindow / maxTokens（保持 1048576 / 256000，这是我确认过的值）。
-6. 仓库是私有的：如果 clone 报认证失败（403 / could not read Username），停下来告诉我，
-   我自己去 gh auth login 或换方式，不要尝试绕开认证。
+6. 仓库是公开的，clone 不需要登录；如果报 403 或超时，那是网络问题（见文末代理说明），别当成权限问题。
 7. 装完只报告事实：每条验收的实际输出，不要写"应该没问题"。
 
 环境前提（先核查，缺什么告诉我）：
@@ -123,13 +122,12 @@
 注意：不要顺便装别的 DSH 插件（比如 dsh-client-next-step-continue），那是另一个任务，这次只做路由器。
 ```
 
-## 交给 AI 之前，你自己准备两件事
+## 交给 AI 之前，你自己准备一件事
 
-1. **对私有仓库的访问权**：那台机器要么已经 `gh auth login` 过，要么你能在浏览器里登录 GitHub
-   完成一次授权，否则 clone 会 403。不想折腾就打包拷过去：
-   `git archive -o router.zip HEAD`（**别**打包整个目录，否则 `.env`、`stats.json` 会一起进去）。
-2. **两个 API key**（DeepSeek 平台、Ollama Cloud）。提示词里写了到第 3 步会停下来等你填，
-   AI 不会向你要，也不会把值打印出来。
+**两个 API key**（DeepSeek 平台、Ollama Cloud）。提示词里写了到第 3 步会停下来等你填，
+AI 不会向你要，也不会把值打印出来。
+
+仓库是公开的，`git clone` 不需要登录、不需要授权码。
 
 ## 仓库里有什么 / 没有什么
 

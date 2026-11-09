@@ -1,0 +1,15 @@
+# 路由器运行时产物：不进版本库
+.env
+*.log
+*.log.1
+stats.json
+stats.json.bak*
+mode.json
+watchdog.state.json
+*.bak*
+tray/*.exe
+tray/*.obj
+tray/*.pdb
+tray/*.ilk
+node_modules/
+archives/

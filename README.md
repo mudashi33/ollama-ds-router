@@ -2,6 +2,8 @@
 
 按北京时间把请求自动发给当前更便宜的那一家，同一套模型（DeepSeek V4.1-Flash）。
 
+> 换一台电脑装？见 [INSTALL-other-pc.md](INSTALL-other-pc.md)（整段复制给那边的 AI 执行即可）。
+
 ## 为什么能省
 
 两家价格几乎一样（同档位差约 6%），但**高峰时段正好错开**：
@@ -174,7 +176,7 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `tools\restart-later.mjs` | 延迟 N 秒重启（默认 150），用于"手头正在流式返回，别现在掐断" |
 | `mode.json` | 当前运行模式（`auto-ds` / `auto-ollama` / `ollama` / `deepseek`），托盘或看板里一改就写这里；删掉即回到 `auto-ds` |
 | `test-modes.mjs` | 四模式调度用例，`node test-modes.mjs`，6 个断言，不联网 |
-| `tray\RouterTray.exe` | 托盘小工具（C++ 单文件，无运行库依赖）：切模式、看余额、看两家高峰期；`--tray` 启动即隐藏窗口 |
+| `tray\RouterTray.exe` | 托盘小工具（C++ 单文件，**已编好入库**，182 KB / x86 静态 CRT / Win7–Win11 免安装）：切模式、看余额、看两家高峰期；`--tray` 启动即隐藏窗口 |
 | `autostart\` | 计划任务 `Ollama-DS-Router` 的入口：`router-hidden.vbs` → `router-loop.cmd`（守护循环，node 崩了 5 秒拉起） |
 | `.env.example` | 两个 key 的模板 |
 
@@ -326,6 +328,8 @@ node test-local.mjs          # 路由 / 映射 / 回退 / 流式
   托盘圆点颜色：蓝 = DeepSeek 官方，绿 = Ollama，灰 = 连不上路由器，**黄 = 某一家余额低了**（DeepSeek < ¥5 或 Ollama < $5，同时气泡提醒一次；余额回上去后再低会重新提醒）。
 - **浏览器看板**：`http://127.0.0.1:8788/` 顶部有四个切换链接。
 - **命令行**：`curl "http://127.0.0.1:8788/_router/prefer?prefer=auto-ollama"`（也可 POST JSON `{"prefer":"ollama"}`）；`curl http://127.0.0.1:8788/_router/mode` 看纯文本快照（当前模式 / 生效上游 / 下次切换 / 余额）。
+
+托盘小工具不用装 VS2019——仓库里的 `tray\RouterTray.exe` 是编好的，clone 下来直接双击；只有要改它的代码才需要跑 `tray\build.cmd`。
 
 托盘小工具想开机自启：把 `RouterTray.exe --tray` 的快捷方式放进「启动」文件夹（本机已经放好：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\RouterTray.lnk`）。
 

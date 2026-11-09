@@ -7,7 +7,7 @@ stats.json.bak*
 mode.json
 watchdog.state.json
 *.bak*
-tray/*.exe
+# tray/RouterTray.exe 有意入库：那边 clone 下来就能直接用，不必装 VS2019
 tray/*.obj
 tray/*.pdb
 tray/*.ilk

@@ -146,6 +146,8 @@ const stats = {
   byEffort: {},
   last: null,
   lastEffort: null,
+  // max_tokens 护栏：DSH 长会话会把 max_tokens 钳成 1（见 applyMaxTokensGuard 注释）
+  maxTokensGuard: { hits: 0, last: null },
 };
 
 // ------------------------------------------------------------------ 最近请求（环形缓冲）
@@ -173,6 +175,52 @@ function effortTag({ thinking, effort }) {
   if (thinking) bits.push(`思考 ${thinking}`);
   if (effort) bits.push(`effort=${effort}`);
   return `  ${bits.join(' / ')}`;
+}
+
+// ------------------------------------------------------- max_tokens 护栏
+//
+// 为什么需要它（2026-11 实测的真实故障）：
+//   DSH 走 pi-ai 系适配器（openai-completions）时，replay 出来的历史 assistant 消息
+//   usage 一律被清零，于是 pi-ai 的 estimateContextTokens() 永远拿不到真实 usage，
+//   退化成「全部字符数 ÷ 3.5」。长会话（本机实测 4,692,754 字符 ≈ 1,340,787 估算 token）
+//   一旦超过模型声明的 contextWindow，clampMaxTokensToContext() 算出的 available
+//   变成负数，又被 Math.max(1, …) 抬成 1 —— 于是 DSH 真的发出 max_tokens=1。
+//   上游老老实实只吐 1 个 token 并回 finish_reason=length，客户端就显示
+//   「已达到输出 token 上限」。官方 deepseek 适配器根本不估算也不钳位，所以同一会话
+//   切到官方就正常 —— 这就是「换官方能继续、用路由器不行」的真正原因。
+//
+// 护栏做的事：把「长对话 + 小得不合理」的 max_tokens 抬回一个能用的下限。
+//   - 只动 messages >= ROUTER_GUARD_MIN_MSGS（默认 20）的请求：
+//     DSH 探活 / 标题 / 摘要这类请求是 1~2 条消息 + 16/32/4096，不能碰。
+//   - 只抬 max_tokens < ROUTER_GUARD_MAX_TOKENS（默认 8192）的：
+//     正常请求是 128000 / 256000，原样不动。
+//     默认取 8192 而不是更大：DSH 实测输入 ~115k token，8192 能让
+//     「输入 + 输出」仍落在 128k 这一档窗口内，不至于主动把请求顶成上下文超长；
+//     而正常回答实测最长约 3.8k token，8192 有两倍余量。
+//   - 抬上去以后若真实输入真的塞不下，上游会回 400 上下文超长 ——
+//     下面的 overflow 分支会原样透传，DSH 据此触发压缩。
+//     比「静默吐 1 个 token」好排查得多。
+//   - ROUTER_GUARD_MAX_TOKENS=0 可整体关掉。
+const GUARD_MAX_TOKENS = Number(process.env.ROUTER_GUARD_MAX_TOKENS ?? 8192);
+const GUARD_MIN_MSGS = Number(process.env.ROUTER_GUARD_MIN_MSGS ?? 20);
+
+function applyMaxTokensGuard(body) {
+  if (!Number.isFinite(GUARD_MAX_TOKENS) || GUARD_MAX_TOKENS <= 0) return null;
+  const msgs = Array.isArray(body?.messages) ? body.messages.length : 0;
+  if (msgs < GUARD_MIN_MSGS) return null;
+  for (const field of ['max_tokens', 'max_completion_tokens']) {
+    const v = body[field];
+    if (typeof v !== 'number' || !Number.isFinite(v) || v >= GUARD_MAX_TOKENS) continue;
+    body[field] = GUARD_MAX_TOKENS;
+    stats.maxTokensGuard.hits++;
+    stats.maxTokensGuard.last = { at: new Date().toISOString(), field, from: v, to: GUARD_MAX_TOKENS, msgs };
+    log(
+      `⚠ max_tokens=${v} 太小而消息有 ${msgs} 条，判定为上下文钳位残留 → 抬到 ${GUARD_MAX_TOKENS}` +
+        `（ROUTER_GUARD_MAX_TOKENS 可调，=0 关闭）`,
+    );
+    return { field, from: v, to: GUARD_MAX_TOKENS };
+  }
+  return null;
 }
 
 /** 不同网关的 usage 字段名不一样，统一成 {prompt, cached, completion} */
@@ -1063,8 +1111,12 @@ async function handle(req, res) {
   const at = now();
   const dsTier = isDeepSeekPeak(at) ? 'peak' : 'off';
   const olTier = isOllamaPeak(at) ? 'peak' : 'off';
+  const guard = applyMaxTokensGuard(body);
   const mtSent = body.max_tokens ?? body.max_completion_tokens;
-  log(`→ ${first}  ${decision.reason}${stream ? '  [stream]' : ''}${effortTag(effort)}  max_tokens=${mtSent === undefined ? '未发送' : mtSent}  msgs=${Array.isArray(body.messages) ? body.messages.length : 0}`);
+  log(
+    `→ ${first}  ${decision.reason}${stream ? '  [stream]' : ''}${effortTag(effort)}  max_tokens=${mtSent === undefined ? '未发送' : mtSent}` +
+      `${guard ? `（原 ${guard.from} 已抬升）` : ''}  msgs=${Array.isArray(body.messages) ? body.messages.length : 0}`,
+  );
 
   for (const id of order) {
     const upstream = cfg.upstreams[id];
@@ -1097,6 +1149,8 @@ async function handle(req, res) {
         stream,
         fallback: id !== first,
         effort: effort?.effort ?? null,
+        maxTokens: mtSent ?? null,
+        maxTokensOriginal: guard?.from ?? null,
         ms: result.ms,
         prompt: usage?.prompt ?? null,
         cached: usage?.cached ?? null,

@@ -98,6 +98,8 @@ function makeMock(name, port) {
         object: 'chat.completion',
         model: body.model,
         server: name,
+        // 回显上游实际收到的输出预算：max_tokens 护栏的断言要靠它
+        served_max_tokens: body.max_tokens ?? body.max_completion_tokens ?? null,
         choices: [{ index: 0, message: { role: 'assistant', content: `reply from ${name}` }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 5, completion_tokens: 3 },
       }),
@@ -274,9 +276,12 @@ async function chat(force, body = {}) {
   await chat(null, { messages: [{ role: 'user', content: '真实请求' }] });
   const r = await fetch('http://127.0.0.1:8799/_router/stats');
   const j = await r.json();
+  // 这次请求走哪一家取决于运行时的模式（auto-ollama 会走 ollama），所以按两家合计断言，
+  // 不然这条断言会随"今天几点跑测试"红绿跳变——它要验的是记账，不是路由。
+  const accounted = j.byProvider.deepseek.prompt + j.byProvider.ollama.prompt;
   const ok =
     j.requests >= 1 &&
-    j.byProvider.deepseek.prompt >= 5 &&
+    accounted >= 5 &&
     j.probeRequests >= 5 &&
     j.probeCny > 0 &&
     typeof j.actualCny === 'number' &&
@@ -353,6 +358,31 @@ async function chat(force, body = {}) {
   );
 }
 
+// 6.7 max_tokens 护栏：DSH 长会话里 pi-ai 会把 max_tokens 钳成 1（估算退化 → available 为负 →
+//     Math.max(1, …)），上游只吐 1 个 token 回 finish_reason=length，客户端就显示「已达到输出
+//     token 上限」。护栏要把「长对话 + 小得不合理」的预算抬回 8192，同时不碰探活/短对话。
+{
+  const long = Array.from({ length: 30 }, (_, i) => ({ role: 'user', content: `m${i}` }));
+  const r1 = await chat('deepseek', { max_tokens: 1, messages: long });
+  const j1 = await r1.json();
+  check('长对话 max_tokens=1 被抬到 8192', j1.served_max_tokens === 8192, `上游收到 ${j1.served_max_tokens}`);
+
+  const r2 = await chat('deepseek', { max_tokens: 32 });
+  const j2 = await r2.json();
+  check('短对话 max_tokens=32 保持原样', j2.served_max_tokens === 32, `上游收到 ${j2.served_max_tokens}`);
+
+  const r3 = await chat('deepseek', { max_tokens: 256000, messages: long });
+  const j3 = await r3.json();
+  check('长对话正常预算不被改动', j3.served_max_tokens === 256000, `上游收到 ${j3.served_max_tokens}`);
+
+  const s = await (await fetch('http://127.0.0.1:8799/_router/stats')).json();
+  const g = s.maxTokensGuard || {};
+  check(
+    '护栏计数可观测',
+    g.hits >= 1 && g.last?.from === 1 && g.last?.to === 8192,
+    `hits=${g.hits} last=${JSON.stringify(g.last)}`,
+  );
+}
 // 7. 两家都挂时返回 503
 {
   await ol.fail(503, 5);

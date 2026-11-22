@@ -11,5 +11,7 @@ watchdog.state.json
 tray/*.obj
 tray/*.pdb
 tray/*.ilk
+# 运行时报告（验证脚本写的，机器专属）
+autostart/*.txt
 node_modules/
 archives/

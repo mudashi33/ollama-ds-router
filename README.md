@@ -352,6 +352,24 @@ node test-local.mjs          # 路由 / 映射 / 回退 / 流式
 - **调时钟测试**：`ROUTER_CLOCK_OFFSET_MS=3600000` 会把路由看到的"现在"整体前移一小时，
   用来在任意时刻验证切换，不影响真实时间。
 
+### max_tokens 护栏（2026-11-22）
+
+长会话偶尔会冒「已达到输出 token 上限」，而同一会话切回官方模型又正常。根因不在代理，
+而在 DSH 的 pi-ai 适配器：重建历史消息时把 `usage` 清零，上下文估算因此退化成「字符数 ÷ 3.5」，
+估算值超过 `contextWindow` 后 `clampMaxTokensToContext()` 把请求里的 `max_tokens` 钳成 **1**，
+上游照做只吐 1 个 token 并回 `finish_reason=length`。官方适配器不估算也不钳位，所以它不出问题。
+
+代理在这里加了一道护栏，把「长对话 + 小得不合理」的输出预算抬回可用值：
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `ROUTER_GUARD_MAX_TOKENS` | `8192` | 低于此值的 `max_tokens` 会被抬到这里；`0` 关闭护栏 |
+| `ROUTER_GUARD_MIN_MSGS` | `20` | 只对消息数达到此值的请求生效（保护探活 / 短对话） |
+
+命中时 `router.log` 写 `max_tokens=8192（原 1 已抬升）`，`/_router/stats` 的
+`maxTokensGuard.hits` 会计数，`/_router/recent` 每条也带 `maxTokens` / `maxTokensOriginal`。
+抬升后若真实输入确实超长，上游回 400 上下文超长并原样透传给客户端，DSH 据此压缩。
+
 ## 出问题时
 
 - **DSH 报 `502 … ECONNREFUSED 127.0.0.1:8788`**：代理没在跑。`schtasks /run /tn "Ollama-DS-Router"`

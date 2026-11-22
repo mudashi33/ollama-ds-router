@@ -1,5 +1,39 @@
 # 变更记录
 
+## 2026-11-22 — max_tokens 护栏（修「已达到输出 token 上限」）
+
+### 问题
+DSH 走 time-router（pi-ai / openai-completions 适配器）时，长会话会突然报
+「已达到输出 token 上限」，同一会话切回官方 deepseek-official 又一切正常。
+
+### 根因（用 app.asar 源码 + 会话存档 + 线上日志三方对齐）
+1. `dsh-llm-pi-ai/src/replay.ts` 重建历史 assistant 消息时把 `usage` 全部清零
+   （`emptyPiUsage()`，时间戳也固定成 0）。
+2. pi-ai 的 `estimateContextTokens()`（`utils/estimate.js`）因此永远拿不到真实 usage，
+   `getLastAssistantUsageInfo()` 恒返回 undefined，只能退化成「全部字符数 ÷ 3.5」。
+   退化估值实测约为真实值的 **1.49 倍**。
+3. 长会话表面积涨到 4,692,754 字符 ≈ 1,340,787 估算 token，超过模型声明的
+   `contextWindow` 后，`clampMaxTokensToContext()`（`api/simple-options.js`）里
+   `available = contextWindow - 估算 - 4096` 变负，被 `Math.max(1, ...)` 抬成 **1**。
+4. 上游只吐 1 个 token 并回 `finish_reason=length`，DSH 就显示「已达到输出 token 上限」。
+   billion-context 的压缩把字符数压回去后又会自己好，所以表现为「时好时坏」。
+5. 官方适配器（`dsh-llm-deepseek`，anthropic-messages）**不做估算也不钳位**
+   （`serialize.ts` 直接 `max_tokens: options.maxTokens ?? ...`），窗口同为 1,048,576，
+   所以同一会话官方永远正常。
+
+### 改动
+- `router.mjs` 新增 `applyMaxTokensGuard()`：转发前检查，**消息数 ≥ `ROUTER_GUARD_MIN_MSGS`（默认 20）
+  且 `max_tokens` < `ROUTER_GUARD_MAX_TOKENS`（默认 8192）** 时，把预算抬回 8192 并打警告日志。
+  - 只碰长对话：DSH 探活 / 标题 / 摘要那些 1~2 条消息 + 16/32/4096 的请求原样放过。
+  - 正常预算（128000 / 256000）一律不动。
+  - 抬上去后若真实输入确实塞不下，上游回 400 上下文超长，走已有的 overflow 原样透传分支，
+    客户端能据此压缩 —— 比「静默只吐 1 个 token」好排查。
+  - `ROUTER_GUARD_MAX_TOKENS=0` 关闭护栏。
+- 统计新增 `maxTokensGuard: { hits, last }`，`/_router/stats` 可查；`/_router/recent` 每条
+  增加 `maxTokens` / `maxTokensOriginal`。日志行形如 `max_tokens=8192（原 1 已抬升）  msgs=101`。
+- `test-local.mjs` 假上游回显 `served_max_tokens`；新增 4 条断言（长对话抬升 / 短对话不动 /
+  正常预算不动 / 计数可观测），并把「用量与成本统计」改成按两家合计断言
+  （原来写死 `byProvider.deepseek`，在 auto-ollama 模式下会无故变红）。测试数 **11 → 15**。
 ## 2026-11-10 — 守护进程、看板最近请求、超时与托盘增强
 
 ### 运行稳定性

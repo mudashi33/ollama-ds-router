@@ -111,8 +111,13 @@ models:
   - id: auto
     name: DeepSeek V4.1 Flash (自动选更便宜的一家)
     contextWindow: 1000000
-    maxTokens: 384000
+    # 输出预算别照着窗口开满：DSH 会把「窗口 - 4096」当可用的输入余量，
+    # maxTokens 一大就更容易被判成「上下文双超限」（实测 35 次 400 里有 31 次是这个）。
+    # 现在这台机器上是 150000，实测下发 128000。
+    maxTokens: 150000
     input: [text, image]
+    # 四档都要写全：DSH 把没声明的档位钉成 null（= 不支持），漏了 low 菜单里就没有低档。
+    # 曾经真丢过 low（线上 cordis.patch.yml 只剩 off/high/max），两家上游其实都认 low。
     reasoningEfforts: {off: null, low: low, high: high, max: max}
     compat: {thinkingFormat: deepseek, maxTokensField: max_tokens,
              requiresReasoningContentOnAssistantMessages: true,
@@ -166,7 +171,7 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `schedule.mjs` | 纯时间规则，无网络依赖；`node schedule.mjs --test` 跑边界用例 |
 | `router.mjs` | 本地 OpenAI 兼容代理，按规则转发 + 失败回退 + 用量记账 |
 | `probe.mjs` | 两家 API 的兼容性冒烟测试（tools / 流式 / 缓存） |
-| `test-local.mjs` | 用假上游回归测试路由逻辑，不联网不花钱 |
+| `test-local.mjs` | 用假上游回归测试路由逻辑（21 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径），不联网不花钱 |
 | `holidays.json` | 中国法定节假日表（这些天 DeepSeek 全天空闲，路由全天走官方）；已含 2027 全年，改后自动重载 |
 | `stats.json` | 按北京日期累计的用量账本，自动生成；删掉即清零 |
 | `setup.mjs` / `setup.cmd` | 一键部署：找回 key、验证、写 `.env`、装自启、启动、查 DSH 配置 |
@@ -177,8 +182,10 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `mode.json` | 当前运行模式（`auto-ds` / `auto-ollama` / `ollama` / `deepseek`），托盘或看板里一改就写这里；删掉即回到 `auto-ds` |
 | `test-modes.mjs` | 四模式调度用例，`node test-modes.mjs`，6 个断言，不联网 |
 | `tray\RouterTray.exe` | 托盘小工具（C++ 单文件，**已编好入库**，182 KB / x86 静态 CRT / Win7–Win11 免安装）：切模式、看余额、看两家高峰期；`--tray` 启动即隐藏窗口 |
-| `autostart\` | 计划任务 `Ollama-DS-Router` 的入口：`router-hidden.vbs` → `router-loop.cmd`（守护循环，node 崩了 5 秒拉起） |
-| `.env.example` | 两个 key 的模板 |
+| `tools\supervisor.mjs` | 守护进程：端口探活 → 起 router → 连续 3 次健康检查失败就重启 → 日志按大小/天数轮转（copytruncate） |
+| `tools\test-log-rotate.mjs` | 日志轮转的回归测试（`node tools/test-log-rotate.mjs`，6 个断言，不联网、不碰 8788） |
+| `autostart\` | 计划任务 `Ollama-DS-Router` 的入口：`router-hidden.vbs` → `tools\supervisor.mjs`（守护：崩了 5 秒拉起、每 30 秒探活） |
+| `.env.example` | 全部 27 个环境变量的模板（必填只有两个 key） |
 
 ## 一键部署（推荐）
 
@@ -250,8 +257,9 @@ node probe.mjs
 自检（不联网）：
 
 ```powershell
-node schedule.mjs --test     # 时间规则边界
-node test-local.mjs          # 路由 / 映射 / 回退 / 流式
+node schedule.mjs --test        # 时间规则边界（13 项）
+node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 记账（21 项）
+node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 ```
 
 ## 第三步：接进 DSH
@@ -270,9 +278,9 @@ node test-local.mjs          # 路由 / 映射 / 回退 / 流式
           - id: auto
             name: DeepSeek V4.1 Flash (自动选更便宜的一家)
             contextWindow: 1000000
-            maxTokens: 384000
+            maxTokens: 150000   # 别开满窗口，见「图片与推理档位」里的说明
             input: [text, image]
-            reasoningEfforts: {off: null, low: low, high: high, max: max}
+            reasoningEfforts: {off: null, low: low, high: high, max: max}   # 四档一个都不能少
             compat: {thinkingFormat: deepseek, maxTokensField: max_tokens,
                      requiresReasoningContentOnAssistantMessages: true,
                      supportsStore: false, supportsDeveloperRole: false}
@@ -301,7 +309,7 @@ node test-local.mjs          # 路由 / 映射 / 回退 / 流式
 | 单实例 | 靠绑控制端口 8790 判断；第二个守护发现端口被占且回包含 `router-supervisor` 就直接退出 |
 | 崩溃重启 | 子进程 `node router.mjs` 退出后 5 秒重拉 |
 | 健康检查 | 每 30 秒打一次 `/_router/status`，连续 3 次失败就杀掉子进程强制重启 |
-| 日志轮转 | 超过 5MB（`ROUTER_LOG_MAX_BYTES`）改名为 `.1` 后重开 |
+| 日志轮转 | 每 30 秒随健康检查看一眼：超过 5MB（`ROUTER_LOG_MAX_BYTES`）或 `ROUTER_LOG_MAX_AGE_DAYS` 天没更新就复制成 `.1` 再清零原文件 |
 
 端口 8788 若被别的进程占着（比如手动开的 `node router.mjs`），守护不会去抢，只每 30 秒探一次，
 等它释放后接管——所以**只从计划任务启动**，别手动起路由，否则会出现"无守护"的实例。
@@ -369,6 +377,53 @@ node test-local.mjs          # 路由 / 映射 / 回退 / 流式
 命中时 `router.log` 写 `max_tokens=8192（原 1 已抬升）`，`/_router/stats` 的
 `maxTokensGuard.hits` 会计数，`/_router/recent` 每条也带 `maxTokens` / `maxTokensOriginal`。
 抬升后若真实输入确实超长，上游回 400 上下文超长并原样透传给客户端，DSH 据此压缩。
+
+### 客户端断开就掐上游（2026-11-22）
+
+DSH 里按 Esc 取消、关窗口、或者网络断了，代理会跟着把上游请求 `abort` 掉。
+以前不传播：探针实测客户端 1.6s 就走了，代理还跑到 3.9s 把整段流收完 —— 上游继续生成、
+继续计费，而客户端早就不要了。现在 `res` 的 `close` 事件（用 `writableEnded` 区分
+「我们自己写完了」和「客户端跑了」）会直接 abort 掉 fetch 的 `AbortSignal`。
+
+这类请求**不算失败**（不是上游的错），单独记在：
+
+- `router.log`：`⊘ Ollama Cloud  客户端断开，已中止上游（4ms）`
+- `/_router/stats`：`clientAborted` 计数，`byProvider.*.failed` 不变
+- 看板最近请求列表：橙色的「⊘ 客户端断开」
+
+顺手补的三个边角：读上游错误正文（429/5xx）期间客户端跑了 → 同样按断开处理，不误记成上游失败；
+「上一家失败、下一家还没发」的空档里客户端跑了 → 直接放弃重试，不再白烧一次调用；
+任何错误响应在客户端已走时都不再往死 socket 上写。
+
+计数口径统一为 **`requests = ok + failed + clientAborted`**（以前 `requests` 只数成功，
+和账本里的按天桶对不上）。
+
+### 失败也进账本（2026-11-22）
+
+以前 `addToDay()` 只在成功分支被调用，于是 `stats.json` 里 `failed` **永远是 0**，
+看板上根本看不出故障率（同一时段日志里其实有 42 条 `✗`）。现在失败走 `recordFailure()`，
+同样按天、按上游分桶记账；看板的「按上游」表格在次数后面挂红字「失败 N」，
+合计行还会单独标「失败 N · 客户端断开 N」。
+
+带 `x-router-force` 的手动探针仍然只算 `probeCny`，不污染账本。
+
+### 日志轮转（2026-11-22）
+
+守护进程原来只在**启动子进程**时检查一次日志大小，连着跑几天就再也不会轮转；
+而且用 `rename` 换文件，子进程的 stdout 句柄还指着改名后的那份，结果 `.1` 越写越大、
+新文件一直是空的。现在改成 logrotate 的 **copytruncate**（备份成 `.1` 再把原文件清零），
+并挂在健康检查的节奏上每 30 秒看一眼，两条规则任一命中就轮转：
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `ROUTER_LOG_MAX_BYTES` | `5242880`（5MB） | 超过就轮转 |
+| `ROUTER_LOG_MAX_AGE_DAYS` | `7` | 超过这么多天没更新也轮转（低频运行时兜底）；`0` = 只看大小 |
+
+两条规则都在**健康检查的节奏上**每 30 秒评估一次，不用等重启。轮转后旧内容在
+`router-supervisor.log.1`（保留一份，第二次轮转时覆盖）。回归测试：`node tools\test-log-rotate.mjs`。
+
+守护自己的日志（`autostart/router-supervisor.log`）和 router 的 stdout 是同一个文件；
+`router.log` 只记进程启动/退出这两行，别在它里面找请求记录。
 
 ## 出问题时
 

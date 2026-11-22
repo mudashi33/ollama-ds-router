@@ -1,5 +1,58 @@
 # 变更记录
 
+## 2026-11-22 — 稳定性三修（客户端断开 / 失败入账 / 日志轮转）
+
+### 1. 客户端断开不再「空转上游」
+以前流式循环只处理「上游断了」，完全不看客户端还在不在。DSH 里按 Esc 取消后，
+代理照样把上游的整段流收完 —— 上游继续生成、继续计费。实测：客户端 1.6s abort，
+代理跑到 3.9s 才写 `✓ Ollama Cloud 3926ms`。
+
+- `attempt()` 拆成 `attempt()` + `attemptOnce()`：外层建 `AbortController` 并挂
+  `res.on('close')`，用 `res.writableEnded` 区分「我们自己写完了」和「客户端跑了」；
+  客户端跑了就 `ac.abort()`，fetch 随之取消。
+- 流式循环加背压：`res.write()` 返回 false 时等 `drain`（同时监听 `close`，否则客户端跑了
+  就永远等不到 drain）。慢客户端 + 长思考时，整段响应不会再堆在进程内存里。
+- 这类请求走新的 `recordClientAbort()`：`stats.clientAborted++`，**不算失败**、不换家，
+  日志写 `⊘ … 客户端断开，已中止上游（Nms）`，`/_router/recent` 里标 `clientGone: true`。
+- 补掉三个边角：①读上游错误正文（429/5xx 的 JSON）期间客户端跑了，也按断开处理，
+  不误记成上游失败；②「上一家失败、下一家还没发」的空档里客户端跑了，直接放弃重试，
+  不再白烧一次上游调用；③`sendJson()` 开头判 `res.writableEnded || res.destroyed`，
+  客户端已走时任何错误响应都不往死 socket 上写（否则 Node 会冒 write after end）。
+
+### 2. 失败终于进账本
+`addToDay()` 以前只在 `record()`（成功分支）里调用，`stats.failed++` 只进内存 ——
+于是 `stats.json` 里 11985 次请求 11985 次 ok、**0 次 failed**，而同一时段日志里有 42 条 `✗`。
+现在失败走 `recordFailure()`：同样按天分桶、按上游分桶，看板「按上游」表在次数后挂红字
+「失败 N」，合计行标「失败 N · 客户端断开 N」。带 `x-router-force` 的探针仍只算 `probeCny`。
+
+顺带修掉一个只有上线后才暴露的坑：老账本的桶里没有 `failed` / `clientAborted` 字段，
+`undefined++` 得到 `NaN`，`JSON.stringify` 再把它写成 **`null`**（线上真出现过
+`"clientAborted": null`，而且会一路传染下去）。现在 `loadHistory()` 读盘时按 `zeroDay()`
+做深合并、把所有计数字段强制归一成有限数字，`addToDay()` 取桶时也再归一一次。
+
+### 3. 日志真的会轮转了
+`tools/supervisor.mjs` 的 `rotateIfNeeded()` 原来只在**启动子进程**时调用一次，
+而且用 `renameSync` 换文件 —— 子进程的 stdout 句柄还指着改名后的那份，
+结果 `.1` 越写越大、新文件一直空的。
+
+- 改成 **copytruncate**：`copyFileSync` 到 `.1` 再 `truncateSync(LOG, 0)`，打开着的句柄不受影响。
+- 挂到健康检查的 `setInterval` 上（默认每 30s 一次），不再依赖「重启一次才轮转」。
+- 新增 `ROUTER_LOG_MAX_AGE_DAYS`（默认 7）：低频运行时只看大小会几个月都轮不到。
+
+### 4. 计数口径统一
+`stats.requests` 以前只在成功分支 ++，而 `stats.json` 的按天桶是「成功 + 失败 + 断开」都算一次，
+于是看板上出现过「今日 12 次」而「本次运行 9 次」这种对不上的情况。现在 `recordFailure()` /
+`recordClientAbort()` 也各自 `requests++`，口径固定为 **`requests = ok + failed + clientAborted`**，
+并有测试断言守着。
+
+### 测试与文档
+- `test-local.mjs`：**15 → 21 项**。新增客户端 abort 传播（假上游 `/_slow` 慢流 +
+  `/_slowstate` 观察是否被掐断）、`clientAborted` 计数与落盘、失败入账与落盘、
+  以及 `requests = ok + failed + clientAborted` 的口径断言。
+- 测试的账本/模式/日志改为写到 `mkdtemp` 临时目录（以前直接跑在仓库里，
+  把测试流量混进真实 `stats.json` 和 `mode.json`，线上账本里那些「测试 2 次」就是它）。
+- `.env.example` 补齐全部 27 个变量（原来只列 4 个）；README 补三节说明，
+  并修正两处 `maxTokens: 384000`（那是「上下文双超限」400 的来源）与 `reasoningEfforts` 缺 `low` 的漂移。
 ## 2026-11-22 — max_tokens 护栏（修「已达到输出 token 上限」）
 
 ### 问题

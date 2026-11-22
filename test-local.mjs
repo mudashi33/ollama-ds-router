@@ -6,11 +6,24 @@
 
 import http from 'node:http';
 import zlib from 'node:zlib';
+import fs from 'node:fs';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+
+// 测试用的账本/模式/日志一律写到临时目录：以前直接跑在仓库里，会把测试流量混进
+// 真实的 stats.json 和 mode.json（线上账本里那些「测试 2 次」就是这么来的）。
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'router-test-'));
+const sandboxEnv = (extra) => ({
+  ...process.env,
+  ROUTER_STATS_FILE: path.join(TMP, 'stats.json'),
+  ROUTER_MODE_FILE: path.join(TMP, 'mode.json'),
+  ROUTER_LOG_FILE: path.join(TMP, 'router.log'),
+  ...extra,
+});
 
 function makeMock(name, port) {
   let calls = 0;
@@ -18,6 +31,11 @@ function makeMock(name, port) {
   let failStatus = 503;
   let gzipNext = false;
   let abortNext = false;
+  // 慢流：每 pieceMs 吐一块，共 pieces 块。用来验证「客户端断开要传播到上游」——
+  // 快流会瞬间写完，路由器还没来得及发现客户端跑了就结束了，测不出来。
+  let slowNext = null;
+  let slowPrematureClose = 0; // 上游视角：自己还没写完就被掐断的次数
+  let slowFinished = 0;
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
@@ -36,6 +54,26 @@ function makeMock(name, port) {
       abortNext = true;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{"abortNext":true}');
+      return;
+    }
+
+    // 控制端点：/_slow?pieces=40&ms=100 —— 下一次流式响应慢慢吐，给客户端留出「中途跑掉」的窗口
+    if (url.pathname === '/_slow') {
+      slowNext = {
+        pieces: Number(url.searchParams.get('pieces') || 40),
+        ms: Number(url.searchParams.get('ms') || 100),
+      };
+      slowPrematureClose = 0;
+      slowFinished = 0;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(slowNext));
+      return;
+    }
+
+    // 控制端点：/_slowstate —— 慢流有没有被上游/客户端掐断
+    if (url.pathname === '/_slowstate') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ prematureClose: slowPrematureClose, finished: slowFinished, pending: slowNext }));
       return;
     }
 
@@ -69,6 +107,28 @@ function makeMock(name, port) {
     }
 
     const id = `chatcmpl-${name}-${calls}`;
+    if (body.stream && slowNext) {
+      const { pieces, ms } = slowNext;
+      slowNext = null;
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.flushHeaders();
+      let closed = false;
+      res.on('close', () => {
+        closed = true;
+        if (!res.writableFinished) slowPrematureClose++;
+      });
+      for (let i = 0; i < pieces && !closed; i++) {
+        const piece = `data: ${JSON.stringify({ id, choices: [{ index: 0, delta: { content: `p${i}` } }] })}\n\n`;
+        if (!res.write(piece)) await new Promise((r) => res.once('drain', r));
+        await sleep(ms);
+      }
+      if (!closed) {
+        slowFinished++;
+        res.write(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 40 } })}\n\n`);
+        res.end('data: [DONE]\n\n');
+      }
+      return;
+    }
     if (body.stream) {
       let sse = '';
       for (const piece of ['he', 'llo']) {
@@ -120,6 +180,12 @@ function makeMock(name, port) {
     abort() {
       return fetch(`http://127.0.0.1:${port}/_abort`);
     },
+    slow(pieces = 40, ms = 100) {
+      return fetch(`http://127.0.0.1:${port}/_slow?pieces=${pieces}&ms=${ms}`);
+    },
+    slowState() {
+      return fetch(`http://127.0.0.1:${port}/_slowstate`).then((r) => r.json());
+    },
   };
 }
 
@@ -131,10 +197,14 @@ const ol = makeMock('ol', 9102);
 await new Promise((r) => ds.server.listen(9101, '127.0.0.1', r));
 await new Promise((r) => ol.server.listen(9102, '127.0.0.1', r));
 
+// 测试固定用 auto-ds（否则线上切到 auto-ollama 后「强制 deepseek」这类断言的含义会变）
+const FIXED_MODE = JSON.stringify({ mode: 'auto-ds', at: new Date().toISOString() });
+fs.writeFileSync(path.join(TMP, 'mode.json'), FIXED_MODE);
+fs.writeFileSync(path.join(TMP, 'mode2.json'), FIXED_MODE);
+
 const router = spawn(process.execPath, ['router.mjs'], {
   cwd: here,
-  env: {
-    ...process.env,
+  env: sandboxEnv({
     ROUTER_PORT: '8799',
     DEEPSEEK_BASE: 'http://127.0.0.1:9101',
     DEEPSEEK_API_KEY: 'test-ds',
@@ -142,7 +212,7 @@ const router = spawn(process.execPath, ['router.mjs'], {
     OLLAMA_BASE: 'http://127.0.0.1:9102/v1',
     OLLAMA_API_KEY: 'test-ol',
     OLLAMA_MODEL: 'deepseek-v4.1-flash',
-  },
+  }),
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 
@@ -173,6 +243,13 @@ const results = [];
 function check(name, ok, detail) {
   results.push({ name, ok, detail });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}  ${detail ?? ''}`);
+}
+
+// 切运行模式：带 x-router-force 的请求会被当成「探针」不计入账本，
+// 所以「要进账本」的断言必须靠切模式来定向，而不是靠 force 头。
+async function setMode(m) {
+  const r = await fetch(`http://127.0.0.1:8799/_router/prefer?prefer=${m}`);
+  return r.json();
 }
 
 async function chat(force, body = {}) {
@@ -306,9 +383,11 @@ async function chat(force, body = {}) {
   const offset = target - Date.now();
   const router2 = spawn(process.execPath, ['router.mjs'], {
     cwd: here,
-    env: {
-      ...process.env,
+    env: sandboxEnv({
       ROUTER_PORT: '8800',
+      ROUTER_STATS_FILE: path.join(TMP, 'stats2.json'),
+      ROUTER_MODE_FILE: path.join(TMP, 'mode2.json'),
+      ROUTER_LOG_FILE: path.join(TMP, 'router2.log'),
       ROUTER_CLOCK_OFFSET_MS: String(offset),
       DEEPSEEK_BASE: 'http://127.0.0.1:9101',
       DEEPSEEK_API_KEY: 'test-ds',
@@ -316,7 +395,7 @@ async function chat(force, body = {}) {
       OLLAMA_BASE: 'http://127.0.0.1:9102/v1',
       OLLAMA_API_KEY: 'test-ol',
       OLLAMA_MODEL: 'deepseek-v4.1-flash',
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let log2 = '';
@@ -383,6 +462,82 @@ async function chat(force, body = {}) {
     `hits=${g.hits} last=${JSON.stringify(g.last)}`,
   );
 }
+// 6.8 客户端中途断开 → 上游请求必须被中止（否则 DSH 按 Esc 之后还在计费）
+{
+  await setMode('ollama'); // 走模式而不是 x-router-force：force 会被当探针、不进账本
+  await ol.slow(60, 100); // 6 秒的慢流，留出足够窗口
+  const before = await (await fetch('http://127.0.0.1:8799/_router/stats')).json();
+  const ac = new AbortController();
+  const p = fetch('http://127.0.0.1:8799/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'auto', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    signal: ac.signal,
+  });
+  p.catch(() => {});
+  // 等第一块数据真的到了，再「按 Esc」，模拟真实使用
+  const resp = await p;
+  const reader = resp.body.getReader();
+  await reader.read();
+  const abortedAt = Date.now();
+  ac.abort();
+  // 上游应该很快发现自己被掐（不是等 60 块吐完）
+  let st = { prematureClose: 0, finished: 0 };
+  for (let i = 0; i < 30; i++) {
+    await sleep(100);
+    st = await ol.slowState();
+    if (st.prematureClose > 0) break;
+  }
+  const ms = Date.now() - abortedAt;
+  check('客户端断开后上游被中止', st.prematureClose >= 1 && st.finished === 0, `prematureClose=${st.prematureClose} finished=${st.finished} 用时 ${ms}ms`);
+
+  await sleep(300);
+  const after = await (await fetch('http://127.0.0.1:8799/_router/stats')).json();
+  check(
+    '客户端断开计数可观测',
+    after.clientAborted > before.clientAborted,
+    `clientAborted ${before.clientAborted} → ${after.clientAborted}`,
+  );
+  // scheduleSave 有 1.5s 防抖，等它落盘再验账本里也记了
+  await sleep(1800);
+  const raw = JSON.parse(fs.readFileSync(path.join(TMP, 'stats.json'), 'utf8'));
+  const days = Object.values(raw.days || {});
+  const day = days[days.length - 1] || {};
+  check(
+    '客户端断开写进账本',
+    (day.clientAborted || 0) >= 1,
+    `stats.json 今日 clientAborted=${day.clientAborted} requests=${day.requests}`,
+  );
+}
+
+// 6.9 失败要进账本（以前 failed 只在内存里，stats.json 里永远是 0）
+{
+  await setMode('deepseek');
+  const before = await (await fetch('http://127.0.0.1:8799/_router/stats')).json();
+  // 两家都回 400：400 是可重试的，于是会依次试过两家、最后 503 —— 正好产生 2 条失败记录
+  await ds.fail(400, 2);
+  await ol.fail(400, 2);
+  const r = await chat(null);
+  const after = await (await fetch('http://127.0.0.1:8799/_router/stats')).json();
+  const dayKeys = Object.keys(after.history?.days || {});
+  const day = after.history.days[dayKeys[dayKeys.length - 1]] || {};
+  check(
+    '失败写进账本（不再恒 0）',
+    r.status >= 400 && after.failed > before.failed && (day.failed || 0) > 0,
+    `status=${r.status} stats.failed ${before.failed}→${after.failed} 今日 failed=${day.failed}`,
+  );
+  await sleep(1800);
+  const raw = JSON.parse(fs.readFileSync(path.join(TMP, 'stats.json'), 'utf8'));
+  const persisted = Object.values(raw.days || {}).reduce((n, d) => n + (d.failed || 0), 0);
+  check('失败计数已落盘', persisted >= 1, `stats.json 累计 failed=${persisted}`);
+  // 口径自洽：总次数必须等于三种结局之和，否则看板上的「今日 N 次」会互相打架
+  check(
+    'requests = ok + failed + clientAborted',
+    after.requests === after.ok + after.failed + after.clientAborted,
+    `requests=${after.requests} ok=${after.ok} failed=${after.failed} clientAborted=${after.clientAborted}`,
+  );
+}
+
 // 7. 两家都挂时返回 503
 {
   await ol.fail(503, 5);
@@ -394,6 +549,9 @@ async function chat(force, body = {}) {
 router.kill();
 ds.server.close();
 ol.server.close();
+
+// 临时目录用完就删（失败时留着，方便看 stats.json 里到底记了什么）
+if (!results.some((r) => !r.ok)) fs.rmSync(TMP, { recursive: true, force: true });
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} 通过`);

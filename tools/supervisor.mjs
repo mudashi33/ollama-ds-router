@@ -22,6 +22,9 @@ const HOST = process.env.ROUTER_HOST || '127.0.0.1';
 const CONTROL_PORT = Number(process.env.ROUTER_SUPERVISOR_PORT || 8790);
 const LOG = process.env.ROUTER_SUPERVISOR_LOG || path.join(ROOT, 'autostart', 'router-supervisor.log');
 const LOG_MAX = Number(process.env.ROUTER_LOG_MAX_BYTES || 5 * 1024 * 1024);
+// 只按大小轮转不够：低频运行时一个 5MB 的日志能攒好几个月，出问题时翻起来全是上古记录。
+// 所以再给一条「最长保留 N 天」的规则；=0 表示只看大小。
+const LOG_MAX_AGE_DAYS = Number(process.env.ROUTER_LOG_MAX_AGE_DAYS || 7);
 const NODE = process.env.NODE_EXE || process.execPath;
 const CHECK_MS = Number(process.env.ROUTER_SUPERVISOR_CHECK_MS || 30000);
 const RESTART_MS = Number(process.env.ROUTER_SUPERVISOR_RESTART_MS || 5000);
@@ -95,21 +98,38 @@ function portBusy() {
 }
 
 // ---------------------------------------------------------------- 日志轮转
-function rotateIfNeeded() {
-  let size = 0;
+// 原来的实现有两个洞：
+//   1) 只在「启动子进程」那一刻检查，于是 router 连着跑几天，日志就一直长；
+//   2) 用 rename 换走文件，可子进程把 LOG 当 stdout/stderr 打开着，rename 之后它
+//      继续往改名后的那份写，结果 .1 越来越大、新的反而是空的。
+// 现在改成「复制 + 截断」（logrotate 的 copytruncate）：留一份 .1 备份，再把原文件
+// 清零，打开着的句柄不受影响（append 模式总是写回 EOF）。轮转由健康检查定时触发。
+function rotateIfNeeded(why = '定时检查') {
+  let st;
   try {
-    size = fs.statSync(LOG).size;
+    st = fs.statSync(LOG);
   } catch {
-    return;
+    return false;
   }
-  if (size < LOG_MAX) return;
+  const tooBig = st.size >= LOG_MAX;
+  const ageDays = (Date.now() - st.mtimeMs) / 86400000;
+  const tooOld = LOG_MAX_AGE_DAYS > 0 && ageDays >= LOG_MAX_AGE_DAYS;
+  if (!tooBig && !tooOld) return false;
+  const sizeText =
+    st.size >= 1024 * 1024
+      ? `${Math.round((st.size / 1024 / 1024) * 10) / 10}MB`
+      : `${Math.max(1, Math.round(st.size / 1024))}KB`;
+  const reason = tooBig ? `已达 ${sizeText}` : `${Math.floor(ageDays)} 天没更新`;
   const bak = LOG + '.1';
   try {
     fs.rmSync(bak, { force: true });
-    fs.renameSync(LOG, bak);
-    fs.writeFileSync(LOG, '[' + new Date().toLocaleString('zh-CN', { hour12: false }) + '] 日志超过 ' + Math.round(LOG_MAX / 1024 / 1024) + 'MB，已轮转为 ' + path.basename(bak) + '\n');
+    fs.copyFileSync(LOG, bak);
+    fs.truncateSync(LOG, 0);
+    log(`日志轮转（${reason}，${why}）：旧内容备份到 ${path.basename(bak)}`);
+    return true;
   } catch (err) {
     log('日志轮转失败：' + err.message);
+    return false;
   }
 }
 
@@ -170,6 +190,9 @@ async function main() {
       let unhealthy = 0;
       const hc = setInterval(async () => {
         if (!child) return;
+        // 日志轮转搭在健康检查的节奏上（默认 30s 一次），否则只有重启时才检查一次，
+        // 连着跑一周的进程永远不会轮到。
+        rotateIfNeeded('定时检查');
         if (await healthOk()) {
           unhealthy = 0;
           return;

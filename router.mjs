@@ -137,6 +137,8 @@ const stats = {
   ok: 0,
   failed: 0,
   fallbacks: 0,
+  // 客户端（DSH 按 Esc / 关窗口）主动断开、把上游请求一起中止的次数
+  clientAborted: 0,
   actualCny: 0,
   // 手动测试请求（带 x-router-force 头）单独统计，避免把"省了多少"搅成负数
   probeRequests: 0,
@@ -287,6 +289,38 @@ function record({ provider, tier, dsTier, usage, ms, fallback, effort, probe }) 
   return { cost };
 }
 
+/**
+ * 记一次失败进账本。失败没有 usage、没有花费，但必须让 /_router/stats 和
+ * stats.json 都能看见——否则看板永远显示"0 失败"，故障率彻底不可见。
+ */
+/**
+ * 计数口径：`requests` 是**总请求数**（成功 + 失败 + 客户端断开），
+ * 由 ok / failed / clientAborted 三者拆开，三者相加恒等于 requests。
+ * 这样内存里的 stats 和 stats.json 里的按天账本口径一致，看板不会出现
+ * 「今日 12 次」和「本次运行 9 次」对不上的情况。
+ */
+function recordFailure({ provider, probe }) {
+  if (probe) return;
+  stats.requests++;
+  stats.failed++;
+  const s = stats.byProvider[provider];
+  if (s) {
+    s.requests++;
+    s.failed++;
+  }
+  addToDay(beijingDateKey(now()), { provider, usage: null, cost: 0, ok: false });
+}
+
+/** 客户端自己走了（不是上游的错），单独记一栏，不算失败 */
+function recordClientAbort({ provider, probe }) {
+  if (probe) return;
+  stats.requests++;
+  stats.clientAborted++;
+  const s = stats.byProvider[provider];
+  if (s) s.requests++;
+  addToDay(beijingDateKey(now()), { provider, usage: null, cost: 0, ok: false, clientAborted: true });
+}
+
 // ------------------------------------------------------------------ 历史账本
 
 // 按北京日期分桶写进 stats.json，重启不清零，看板才能回答"这个月省了多少"
@@ -296,13 +330,14 @@ const zeroDay = () => ({
   requests: 0,
   ok: 0,
   failed: 0,
+  clientAborted: 0,
   prompt: 0,
   cached: 0,
   completion: 0,
   costCny: 0,
   byProvider: {
-    deepseek: { requests: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 },
-    ollama: { requests: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 },
+    deepseek: { requests: 0, failed: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 },
+    ollama: { requests: 0, failed: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 },
   },
 });
 
@@ -315,6 +350,33 @@ function loadHistory() {
     return;
   }
   if (raw && raw.days && typeof raw.days === 'object') history.days = raw.days;
+  // 老账本里没有后来新增的字段（failed / clientAborted），而且「字段缺失时 ++ 会得到 NaN，
+  // JSON.stringify 又把 NaN 写成 null」—— 线上真出现过 "clientAborted": null。所以这里
+  // 不只补默认值，还要把所有计数字段强制归一到有限数字，否则一个 null 会一路传染下去。
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const COUNTERS = ['requests', 'ok', 'failed', 'clientAborted', 'prompt', 'cached', 'completion', 'costCny'];
+  for (const [k, d] of Object.entries(history.days)) {
+    if (!d || typeof d !== 'object') {
+      delete history.days[k];
+      continue;
+    }
+    const base = zeroDay();
+    const day = { ...base };
+    for (const f of COUNTERS) day[f] = num(d[f] ?? base[f]);
+    day.byProvider = {};
+    for (const id of new Set([...Object.keys(base.byProvider), ...Object.keys(d.byProvider || {})])) {
+      const z = base.byProvider[id] || { requests: 0, failed: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 };
+      const s = d.byProvider?.[id] || {};
+      const merged = {};
+      for (const f of COUNTERS) merged[f] = num(s[f] ?? z[f] ?? 0);
+      day.byProvider[id] = merged;
+    }
+    // 口径自检：requests 必须等于三种结局之和。老账本里曾有过渡版本写歪过（多算几次），
+    // 不擅自改历史，但要留一条日志，免得以后拿它当基准算出错误的故障率。
+    const split = day.ok + day.failed + day.clientAborted;
+    if (day.requests !== split) log(`账本 ${k} 口径不一致：requests=${day.requests} 但 ok+failed+clientAborted=${split}（历史遗留，不改写）`);
+    history.days[k] = day;
+  }
   // 账本按天分桶，永远只增不减；一年就是 365 个桶，留着够看，再旧的就裁掉
   const keepDays = Number(process.env.ROUTER_STATS_KEEP_DAYS || 365);
   const keys = Object.keys(history.days).sort();
@@ -337,13 +399,37 @@ function scheduleSave() {
   if (saveTimer.unref) saveTimer.unref();
 }
 
-function addToDay(day, { provider, usage, cost }) {
-  const d = (history.days[day] ||= zeroDay());
+/**
+ * 记一次「有结论的请求」进历史账本（成功、失败都算，客户端主动断开单独记）。
+ * 以前只有成功分支调用它，于是 stats.json 里 failed 永远是 0 —— 看板看不见故障率。
+ */
+function addToDay(day, { provider, usage, cost, ok = true, clientAborted = false }) {
+  // 桶可能来自旧版本账本（没有 clientAborted 字段），undefined++ 会得到 NaN、
+  // 再被 JSON.stringify 写成 null。所以每次拿桶都先和 zeroDay() 合一次 ——
+  // byProvider 必须逐个 provider 深合，浅合会把整块 provider 换成没有新字段的旧对象。
+  const prev = history.days[day] || {};
+  const d = (history.days[day] = { ...zeroDay(), ...prev, byProvider: {} });
+  for (const id of new Set([...Object.keys(zeroDay().byProvider), ...Object.keys(prev.byProvider || {})])) {
+    const z = zeroDay().byProvider[id] || { requests: 0, failed: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 };
+    d.byProvider[id] = { ...z, ...(prev.byProvider?.[id] || {}) };
+  }
+  // 旧桶里可能是 null（历史上真写出过 "clientAborted": null），null++ 会变 1 但语义已丢，
+  // 统一先归零再累加，账本才不会带着脏值往下滚。
+  for (const f of ['requests', 'ok', 'failed', 'clientAborted', 'prompt', 'cached', 'completion', 'costCny']) {
+    if (!Number.isFinite(d[f])) d[f] = 0;
+  }
   d.requests++;
-  d.ok++;
+  if (clientAborted) d.clientAborted++;
+  else if (ok) d.ok++;
+  else d.failed++;
   d.costCny += cost;
-  const p = (d.byProvider[provider] ||= { requests: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 });
+  const p = (d.byProvider[provider] ||= { requests: 0, failed: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 });
+  // 老桶可能缺 failed：这里也补一次，免得 p.failed++ 变 NaN
+  for (const f of ['requests', 'failed', 'prompt', 'cached', 'completion', 'costCny']) {
+    if (!Number.isFinite(p[f])) p[f] = 0;
+  }
   p.requests++;
+  if (!ok && !clientAborted) p.failed++;
   p.costCny += cost;
   if (usage) {
     d.prompt += usage.prompt;
@@ -361,13 +447,13 @@ function sumDays(keys) {
   for (const k of keys) {
     const d = history.days[k];
     if (!d) continue;
-    for (const f of ['requests', 'ok', 'failed', 'prompt', 'cached', 'completion', 'costCny']) {
+    for (const f of ['requests', 'ok', 'failed', 'clientAborted', 'prompt', 'cached', 'completion', 'costCny']) {
       t[f] += d[f] || 0;
     }
     for (const id of ['deepseek', 'ollama']) {
       const s = (d.byProvider && d.byProvider[id]) || {};
       const o = t.byProvider[id];
-      for (const f of ['requests', 'prompt', 'cached', 'completion', 'costCny']) o[f] += s[f] || 0;
+      for (const f of ['requests', 'failed', 'prompt', 'cached', 'completion', 'costCny']) o[f] += s[f] || 0;
     }
   }
   return t;
@@ -551,6 +637,9 @@ async function readBody(req, limit) {
 }
 
 function sendJson(res, status, obj) {
+  // 客户端已经走了（DSH 按 Esc、关窗口）就别再往死 socket 上写：写了没人收，
+  // 还可能在 Node 里冒一个 'write after end'。所有错误路径都靠这一处兜底。
+  if (res.writableEnded || res.destroyed) return;
   const body = Buffer.from(JSON.stringify(obj, null, 2));
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': body.length });
   res.end(body);
@@ -563,10 +652,30 @@ function sendJson(res, status, obj) {
  * 返回 { ok:false, retryable, reason } 表示还没写任何字节，可以换一家重试。
  */
 async function attempt(upstream, payload, res, opts = {}) {
-  const url = `${upstream.base}/chat/completions`;
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(new Error('首字节超时')), cfg.firstByteTimeoutMs);
   const t0 = Date.now();
+  // 客户端（DSH 里按 Esc、关窗口、网络掉线）一旦走了，上游请求必须跟着取消：否则上游会
+  // 继续生成、继续计费，而客户端早就不要这个结果了。res 的 'close' 在正常 end() 之后
+  // 也会触发，所以用 writableEnded 把「我们自己写完了」和「客户端跑了」区分开。
+  let clientGone = false;
+  const onClientClose = () => {
+    if (res.writableEnded) return;
+    clientGone = true;
+    ac.abort(new Error('客户端已断开'));
+  };
+  res.on('close', onClientClose);
+  try {
+    return await attemptOnce(upstream, payload, res, { ...opts, ac, t0, isClientGone: () => clientGone });
+  } finally {
+    res.off('close', onClientClose);
+  }
+}
+
+/** attempt 的本体：ac / t0 由外层建好传进来，客户端断开监听只挂一次。 */
+async function attemptOnce(upstream, payload, res, opts) {
+  const { ac, t0, isClientGone } = opts;
+  const url = `${upstream.base}/chat/completions`;
+  const timer = setTimeout(() => ac.abort(new Error('首字节超时')), cfg.firstByteTimeoutMs);
 
   let upstreamRes;
   try {
@@ -581,12 +690,18 @@ async function attempt(upstream, payload, res, opts = {}) {
     });
   } catch (err) {
     clearTimeout(timer);
+    if (isClientGone()) return { ok: false, clientGone: true, reason: '客户端已断开', ms: Date.now() - t0 };
     return { ok: false, retryable: true, reason: `连接失败: ${err?.message || err}`, ms: Date.now() - t0 };
   }
   clearTimeout(timer); // 已拿到响应头，后续流式不再设整段超时
 
   if (!upstreamRes.ok) {
     const text = await upstreamRes.text().catch(() => '');
+    // 读错误正文（429/5xx 的 JSON）期间客户端可能已经走了：这时既不能当上游失败记账，
+    // 更不能接着去换另一家——那会再凭空生成一整段没人要的响应。
+    if (isClientGone()) {
+      return { ok: false, clientGone: true, reason: '客户端已断开（上游返回错误前已中止）', ms: Date.now() - t0 };
+    }
     const overflow = isContextOverflow(text);
     return {
       ok: false,
@@ -640,6 +755,19 @@ async function attempt(upstream, payload, res, opts = {}) {
       idleTimer = null;
     }
   };
+  // 背压：res.write() 返回 false 表示内核缓冲区满了（客户端读得比上游吐得慢）。
+  // 不理会它的话，整段响应会堆在进程内存里，慢客户端 + 长思考就能把路由器顶爆。
+  // 等 'drain'，但客户端中途跑掉时 'drain' 永远不会来，所以同时等 'close'。
+  const waitDrain = () =>
+    new Promise((resolve) => {
+      const done = () => {
+        res.off('drain', done);
+        res.off('close', done);
+        resolve();
+      };
+      res.once('drain', done);
+      res.once('close', done);
+    });
   try {
     while (true) {
       armIdle();
@@ -647,12 +775,15 @@ async function attempt(upstream, payload, res, opts = {}) {
       disarmIdle();
       if (done) break;
       markSent();
-      res.write(value);
       // 只留尾部：usage 总在流的最后，没必要缓存整个响应
       tail += decoder.decode(value, { stream: true });
       if (tail.length > 256 * 1024) tail = tail.slice(-256 * 1024);
+      if (!res.write(value)) await waitDrain();
     }
   } catch (err) {
+    if (isClientGone()) {
+      return { ok: false, clientGone: true, reason: '客户端已断开（上游请求已中止）', ms: Date.now() - t0 };
+    }
     if (!sent) {
       // 一个字节都没发出去，交给上层换一家
       return { ok: false, retryable: true, reason: `流在首字节前中断: ${err?.message || err}`, ms: Date.now() - t0 };
@@ -660,6 +791,9 @@ async function attempt(upstream, payload, res, opts = {}) {
     log(`  流中断: ${err?.message || err}`);
   } finally {
     disarmIdle();
+  }
+  if (isClientGone()) {
+    return { ok: false, clientGone: true, reason: '客户端已断开（上游请求已中止）', ms: Date.now() - t0 };
   }
   markSent();
   tail += decoder.decode();
@@ -752,7 +886,7 @@ async function dashboardHtml() {
   const rows = Object.entries(v.byProvider)
     .map(
       ([id, s]) =>
-        `<tr><td>${cfg.upstreams[id].label}</td><td>${s.requests}</td><td>${s.prompt.toLocaleString()}</td>` +
+        `<tr><td>${cfg.upstreams[id].label}</td><td>${s.requests}${s.failed ? ` <span class="warn">失败 ${s.failed}</span>` : ''}</td><td>${s.prompt.toLocaleString()}</td>` +
         `<td>${s.cached.toLocaleString()}</td><td>${s.completion.toLocaleString()}</td><td>${money(s.costCny)}</td></tr>`,
     )
     .join('');
@@ -795,13 +929,20 @@ async function dashboardHtml() {
   const cellOf = (t, id) => {
     const s = (t.byProvider && t.byProvider[id]) || {};
     const tk = (s.prompt || 0) + (s.completion || 0);
-    return `<td>${s.requests || 0} 次<br><span class="dim">${tok(tk)} token</span><br>${money(s.costCny || 0)}</td>`;
+    // 失败数直接挂在次数后面：以前账本只记成功，看板上根本看不出这家挂过
+    const bad = s.failed > 0 ? ` <span class="warn">失败 ${s.failed}</span>` : '';
+    return `<td>${s.requests || 0} 次${bad}<br><span class="dim">${tok(tk)} token</span><br>${money(s.costCny || 0)}</td>`;
   };
   const upRows = Object.keys(cfg.upstreams)
     .map((id) => `<tr><td>${cfg.upstreams[id].label}</td>${periods.map(([, t]) => cellOf(t, id)).join('')}</tr>`)
     .join('');
   const upTotal = `<tr><td>合计</td>${periods
-    .map(([, t]) => `<td>${t.requests} 次<br><span class="dim">${tok(t.tokens.input + t.tokens.output)} token</span><br>${money(t.costCny)}</td>`)
+    .map(([, t]) => {
+      const bad = t.failed > 0 || t.clientAborted > 0
+        ? `<br><span class="warn">失败 ${t.failed || 0}${t.clientAborted ? ` · 客户端断开 ${t.clientAborted}` : ''}</span>`
+        : '';
+      return `<td>${t.requests} 次<br><span class="dim">${tok(t.tokens.input + t.tokens.output)} token</span><br>${money(t.costCny)}${bad}</td>`;
+    })
     .join('')}</tr>`;
   // 每家花了多少：只列真正有请求的那几家
   const split = (t) =>
@@ -817,7 +958,11 @@ async function dashboardHtml() {
       const hhmm = t
         ? `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}:${String(t.getSeconds()).padStart(2, '0')}`
         : '';
-      const result = e.ok ? '<span style="color:#4ade80">✓</span>' : `<span style="color:#f87171">✗ ${e.status ?? ''}</span>`;
+      const result = e.ok
+        ? '<span style="color:#4ade80">✓</span>'
+        : e.clientGone
+          ? '<span style="color:#fbbf24">⊘ 客户端断开</span>'
+          : `<span style="color:#f87171">✗ ${e.status ?? ''}</span>`;
       const tk = (e.prompt ?? 0) + (e.completion ?? 0);
       const detail = e.ok
         ? `${tok(tk)} · ${money(e.costCny || 0)}`
@@ -841,6 +986,7 @@ async function dashboardHtml() {
   .card b{display:block;font-size:20px;margin-top:4px}
   .sub{display:block;color:#8b95a3;font-size:12px;margin-top:4px}
   .dim{color:#8b95a3;font-size:12px}
+  .warn{color:#f87171;font-size:12px}
   .lbl{color:#8b95a3;font-size:12px}
   table{border-collapse:collapse;width:100%;margin-top:8px}
   th,td{text-align:right;padding:7px 10px;border-bottom:1px solid #232833}
@@ -978,6 +1124,8 @@ async function modeSnapshot() {
     `todayRequests=${h.today.requests}`,
     `todayCostCny=${Number(h.today.costCny).toFixed(4)}`,
     `requests=${stats.requests}`,
+    `failed=${stats.failed}`,
+    `clientAborted=${stats.clientAborted}`,
     `costCny=${Number(stats.actualCny).toFixed(4)}`,
   ].join('\n') + '\n';
 }
@@ -1124,6 +1272,25 @@ async function handle(req, res) {
       JSON.stringify({ ...body, model: mapModel(body.model, upstream) }),
     );
     const result = await attempt(upstream, payload, res);
+    if (result.clientGone) {
+      // 客户端自己走了：不算失败、不换家（它已经收不到任何东西了），只留一条日志
+      recordClientAbort({ provider: id, probe: decision.forced === true });
+      log(`⊘ ${upstream.label}  客户端断开，已中止上游（${result.ms}ms）`);
+      pushRecent({
+        at: new Date().toISOString(),
+        ok: false,
+        clientGone: true,
+        provider: id,
+        upstream: upstream.label,
+        mode,
+        stream,
+        ms: result.ms ?? null,
+        reason: result.reason,
+      });
+      if (!res.headersSent) return sendJson(res, 499, { error: { message: '客户端已断开' } });
+      if (!res.writableEnded) res.end();
+      return;
+    }
     if (result.ok) {
       const usage = normalizeUsage(result.usage);
       const r = record({
@@ -1159,8 +1326,7 @@ async function handle(req, res) {
       });
       return;
     }
-    stats.failed++;
-    stats.byProvider[id].failed++;
+    recordFailure({ provider: id, probe: decision.forced === true });
     log(`✗ ${upstream.label}  ${result.reason}`);
     pushRecent({
       at: new Date().toISOString(),
@@ -1184,10 +1350,18 @@ async function handle(req, res) {
       return sendJson(res, result.status || 400, parsed ?? { error: { message: raw.slice(0, 2000), type: 'context_length_exceeded' } });
     }
     if (!result.retryable) {
+      // 客户端早跑了就没人收这条错误，别再往一个已销毁的 socket 上写
+      if (res.destroyed) return;
       return sendJson(res, result.status || 502, { error: { message: result.reason } });
     }
     if (res.headersSent) {
       res.end();
+      return;
+    }
+    if (res.destroyed) {
+      // 客户端在「上一家失败、下一家还没发」的空档断开：别再去打下一家，白烧一次上游调用
+      recordClientAbort({ provider: id, probe: decision.forced === true });
+      log('⊘ 客户端已断开，不再重试下一家');
       return;
     }
   }

@@ -1,5 +1,8 @@
 # 在另一台电脑上安装 ollama-ds-router
 
+> **已经装过、只想升级到最新版？** 看 [UPDATE-other-pc.md](UPDATE-other-pc.md)：那是 `git pull` 增量更新的提示词，
+> 不要重装、不要重新 clone。
+
 把下面 **整段** 复制给那台电脑上的 AI（Claude / Codex / DSH 都行）。
 
 ```text
@@ -18,7 +21,8 @@
 3. API key 由我自己填进 .env：你不要向我要 key，也不要把 key 打印到聊天、日志或命令回显里；
    不要 cat/type/Get-Content 整个 .env。
 4. 不要 npm install、不要 pnpm install —— 这个项目零运行时依赖，只用 Node 内置模块。
-5. 不要改 DSH 的 contextWindow / maxTokens（保持 1048576 / 256000，这是我确认过的值）。
+5. DSH 侧只按下面第 5 步给的参数写：contextWindow 保持 1048576，maxTokens 填 150000
+   （别按窗口开满——那是「上下文双超限」400 的来源，本机实测下发 128000）。
 6. 仓库是公开的，clone 不需要登录；如果报 403 或超时，那是网络问题（见文末代理说明），别当成权限问题。
 7. 装完只报告事实：每条验收的实际输出，不要写"应该没问题"。
 
@@ -39,7 +43,9 @@
 
 2) 自检（项目自带测试，不需要任何依赖）
    node schedule.mjs --test     → 期望 13/13 PASS（高峰判定、节假日、边界时刻）
-   node test-local.mjs          → 期望 11/11 PASS（429 回退、参数方言回退、SSE 透传、gzip 头、成本计算、双失败 503 等）
+   node test-local.mjs          → 期望 21/21 PASS（429 回退、参数方言回退、SSE 透传、gzip 头、成本计算、
+                                   max_tokens 护栏、客户端断开传播、失败入账、双失败 503 等）
+   node tools/test-log-rotate.mjs → 期望 6/6 PASS（守护进程日志的 copytruncate 轮转）
    任何一条失败：把完整报错贴给我，不要继续。
 
 3) 配置密钥（交接点：这里必须停下来等我）
@@ -71,12 +77,13 @@
               - id: auto
                 name: DeepSeek V4.1 Flash (自动选更便宜的一家)
                 contextWindow: 1048576
-                maxTokens: 256000
+                maxTokens: 150000
                 input:
                   - text
                   - image
                 reasoningEfforts:
                   off: null
+                  low: low
                   high: high
                   max: max
                 compat:

@@ -3,6 +3,7 @@
 按北京时间把请求自动发给当前更便宜的那一家，同一套模型（DeepSeek V4.1-Flash）。
 
 > 换一台电脑装？见 [INSTALL-other-pc.md](INSTALL-other-pc.md)（整段复制给那边的 AI 执行即可）。
+> 那边已经装过、只想升级？见 [UPDATE-other-pc.md](UPDATE-other-pc.md)（`git pull` 增量更新，不要重装）。
 
 ## 为什么能省
 

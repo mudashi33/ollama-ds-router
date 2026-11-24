@@ -40,7 +40,13 @@ const cfg = {
   firstByteTimeoutMs: Number(process.env.ROUTER_FIRST_BYTE_TIMEOUT_MS || 60000),
   // 流式/长响应期间上游「突然不说话」的容忍时间（每读到一块就重新计时）
   idleTimeoutMs: Number(process.env.ROUTER_IDLE_TIMEOUT_MS || 120000),
+  // 读上游错误正文（4xx/5xx 的 JSON）的上限。正常几百字节就结束，等这么久只是兜底：
+  // 上游回了响应头却把正文挂住时，不能跟着它一起挂（客户端早就等不及了）。
+  errorBodyTimeoutMs: Number(process.env.ROUTER_ERROR_BODY_TIMEOUT_MS || 15000),
   bodyLimitBytes: 64 * 1024 * 1024,
+  // 余额只是看板上的两张卡，宁可 2 秒拿不到显示「取不到」，也不能让整页跟着卡
+  balanceTimeoutMs: Number(process.env.ROUTER_BALANCE_TIMEOUT_MS || 3000),
+  balanceTtlMs: Number(process.env.ROUTER_BALANCE_TTL_MS ?? 60000),
   upstreams: {
     deepseek: {
       id: 'deepseek',
@@ -133,6 +139,10 @@ const PRICES = {
 const emptyStats = () => ({ requests: 0, ok: 0, failed: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 });
 const stats = {
   startedAt: new Date().toISOString(),
+  // 用户真正发起的请求数（一个请求可能要试两家）
+  userRequests: 0,
+  // 上游尝试次数：一次用户请求若首选失败再兜底，会记 2 次。
+  // 二者必须分开——否则「今天用了 2 次」里有一次只是失败重试，用户会觉得莫名其妙。
   requests: 0,
   ok: 0,
   failed: 0,
@@ -215,19 +225,33 @@ function applyMaxTokensGuard(body) {
   if (!Number.isFinite(GUARD_MAX_TOKENS) || GUARD_MAX_TOKENS <= 0) return null;
   const msgs = Array.isArray(body?.messages) ? body.messages.length : 0;
   if (msgs < GUARD_MIN_MSGS) return null;
+  // 两个字段都要看，不能命中第一个就 return：OpenAI 系上游里 max_completion_tokens 优先级
+  // 高于 max_tokens，只改前者等于没改（实测上游会照旧按 max_completion_tokens=1 只吐 1 个 token）。
+  // 字符串形式（"1"）也认：有些网关把数字序列化成字符串，typeof !== 'number' 直接跳过同样等于没改。
+  const raised = [];
   for (const field of ['max_tokens', 'max_completion_tokens']) {
-    const v = body[field];
-    if (typeof v !== 'number' || !Number.isFinite(v) || v >= GUARD_MAX_TOKENS) continue;
+    const raw = body[field];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const v = typeof raw === 'number' ? raw : Number(raw);
+    if (!Number.isFinite(v) || v >= GUARD_MAX_TOKENS) continue;
     body[field] = GUARD_MAX_TOKENS;
-    stats.maxTokensGuard.hits++;
-    stats.maxTokensGuard.last = { at: new Date().toISOString(), field, from: v, to: GUARD_MAX_TOKENS, msgs };
+    raised.push({ field, from: v, stringForm: typeof raw === 'string' });
     log(
-      `⚠ max_tokens=${v} 太小而消息有 ${msgs} 条，判定为上下文钳位残留 → 抬到 ${GUARD_MAX_TOKENS}` +
+      `⚠ ${field}=${raw} 太小而消息有 ${msgs} 条，判定为上下文钳位残留 → 抬到 ${GUARD_MAX_TOKENS}` +
         `（ROUTER_GUARD_MAX_TOKENS 可调，=0 关闭）`,
     );
-    return { field, from: v, to: GUARD_MAX_TOKENS };
   }
-  return null;
+  if (!raised.length) return null;
+  stats.maxTokensGuard.hits++;
+  stats.maxTokensGuard.last = {
+    at: new Date().toISOString(),
+    field: raised.map((r) => r.field).join('+'),
+    from: raised[0].from,
+    to: GUARD_MAX_TOKENS,
+    msgs,
+    fields: raised,
+  };
+  return { field: raised[0].field, from: raised[0].from, to: GUARD_MAX_TOKENS, fields: raised };
 }
 
 /** 不同网关的 usage 字段名不一样，统一成 {prompt, cached, completion} */
@@ -264,7 +288,7 @@ const fmtCny = (n) => `¥${n < 0.01 ? n.toFixed(6) : n.toFixed(4)}`;
  * `probe: true`（带 x-router-force 的手动测试请求）只单独计入 probeCny，
  * 不参与"省了多少"——否则测试请求会把省钱数字搅成负数。
  */
-function record({ provider, tier, dsTier, usage, ms, fallback, effort, probe }) {
+function record({ provider, tier, dsTier, usage, ms, fallback, effort, probe, first = false }) {
   const s = stats.byProvider[provider];
   const cost = usage ? costCny(provider, tier, usage) : 0;
   if (probe) {
@@ -276,6 +300,7 @@ function record({ provider, tier, dsTier, usage, ms, fallback, effort, probe }) 
     stats.ok++;
     s.requests++;
     s.ok++;
+    if (first) stats.userRequests++;
   }
   if (fallback && !probe) stats.fallbacks++;
   const key = effort?.effort || (effort?.thinking === 'disabled' ? 'off' : '未指定');
@@ -288,7 +313,7 @@ function record({ provider, tier, dsTier, usage, ms, fallback, effort, probe }) 
     stats.actualCny += cost;
     stats.last = { at: new Date().toISOString(), provider, ms, usage, costCny: cost, effort };
   }
-  if (!probe) addToDay(beijingDateKey(now()), { provider, usage, cost });
+  if (!probe) addToDay(beijingDateKey(now()), { provider, usage, cost, userRequest: first });
   // 无论上游有没有回 usage，都记下"这一次请求的思考档位"——这是证明档位真的下发的凭据
   stats.lastEffort = { at: new Date().toISOString(), provider, ...effort };
   return { cost };
@@ -297,33 +322,34 @@ function record({ provider, tier, dsTier, usage, ms, fallback, effort, probe }) 
 /**
  * 记一次失败进账本。失败没有 usage、没有花费，但必须让 /_router/stats 和
  * stats.json 都能看见——否则看板永远显示"0 失败"，故障率彻底不可见。
- */
-/**
- * 计数口径：`requests` 是**总请求数**（成功 + 失败 + 客户端断开），
+ *
+ * 计数口径：`requests` 是**上游尝试次数**（成功 + 失败 + 客户端断开），
  * 由 ok / failed / clientAborted 三者拆开，三者相加恒等于 requests。
- * 这样内存里的 stats 和 stats.json 里的按天账本口径一致，看板不会出现
- * 「今日 12 次」和「本次运行 9 次」对不上的情况。
+ * 用户真正发起的请求数另记在 `userRequests`：一次提问若首选失败再兜底成功，
+ * requests 会 +2 而 userRequests 只 +1（见 addToDay 的 `userRequest` 参数）。
  */
-function recordFailure({ provider, probe }) {
+function recordFailure({ provider, probe, first = false }) {
   if (probe) return;
   stats.requests++;
   stats.failed++;
+  if (first) stats.userRequests++;
   const s = stats.byProvider[provider];
   if (s) {
     s.requests++;
     s.failed++;
   }
-  addToDay(beijingDateKey(now()), { provider, usage: null, cost: 0, ok: false });
+  addToDay(beijingDateKey(now()), { provider, usage: null, cost: 0, ok: false, userRequest: first });
 }
 
 /** 客户端自己走了（不是上游的错），单独记一栏，不算失败 */
-function recordClientAbort({ provider, probe }) {
+function recordClientAbort({ provider, probe, first = false }) {
   if (probe) return;
   stats.requests++;
   stats.clientAborted++;
+  if (first) stats.userRequests++;
   const s = stats.byProvider[provider];
   if (s) s.requests++;
-  addToDay(beijingDateKey(now()), { provider, usage: null, cost: 0, ok: false, clientAborted: true });
+  addToDay(beijingDateKey(now()), { provider, usage: null, cost: 0, ok: false, clientAborted: true, userRequest: first });
 }
 
 // ------------------------------------------------------------------ 历史账本
@@ -332,6 +358,8 @@ function recordClientAbort({ provider, probe }) {
 const STATS_FILE = process.env.ROUTER_STATS_FILE || path.join(HERE, 'stats.json');
 const history = { days: {} };
 const zeroDay = () => ({
+  // 用户发起的请求数（一个请求可能产生多次上游尝试）
+  userRequests: 0,
   requests: 0,
   ok: 0,
   failed: 0,
@@ -355,11 +383,18 @@ function loadHistory() {
     return;
   }
   if (raw && raw.days && typeof raw.days === 'object') history.days = raw.days;
+  // version 1 的账本没有 userRequests 字段（2026-11-24 才加）。用文件版本号而不是
+  // 「字段看着不对」来判断，回填只做一次：写回 version 2 之后，任何一天都不会再被改。
+  const legacy = !(Number(raw?.version) >= 2);
   // 老账本里没有后来新增的字段（failed / clientAborted），而且「字段缺失时 ++ 会得到 NaN，
   // JSON.stringify 又把 NaN 写成 null」—— 线上真出现过 "clientAborted": null。所以这里
   // 不只补默认值，还要把所有计数字段强制归一到有限数字，否则一个 null 会一路传染下去。
   const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
-  const COUNTERS = ['requests', 'ok', 'failed', 'clientAborted', 'prompt', 'cached', 'completion', 'costCny'];
+  const COUNTERS = ['userRequests', 'requests', 'ok', 'failed', 'clientAborted', 'prompt', 'cached', 'completion', 'costCny'];
+  // 分上游的桶不需要 userRequests / ok / clientAborted：这三项只在合计层有意义
+  // （一次提问只算一次用户请求，逐家累加会重复）。写进 byProvider 只会留下永远为 0 的脏字段。
+  const PROVIDER_COUNTERS = ['requests', 'failed', 'prompt', 'cached', 'completion', 'costCny'];
+  let backfilled = 0;
   for (const [k, d] of Object.entries(history.days)) {
     if (!d || typeof d !== 'object') {
       delete history.days[k];
@@ -368,12 +403,20 @@ function loadHistory() {
     const base = zeroDay();
     const day = { ...base };
     for (const f of COUNTERS) day[f] = num(d[f] ?? base[f]);
+    // version 1 的账本没有 userRequests（该字段 2026-11-24 才加），读出来是 0。
+    // 填 0 会让看板显示「18 次」而 requests 是 1312——比不显示更误导。
+    // 回填取 requests 这个上界：两者只差「首选失败后兜底重试」的次数，历史上是几十的量级，
+    // 所以估算误差很小；而且宁可略高也不要抹成 0。只对 legacy 账本做，写回 version 2 后不再重复。
+    if (legacy && day.requests > 0 && (d.userRequests === undefined || d.userRequests === null)) {
+      day.userRequests = day.requests;
+      backfilled++;
+    }
     day.byProvider = {};
     for (const id of new Set([...Object.keys(base.byProvider), ...Object.keys(d.byProvider || {})])) {
       const z = base.byProvider[id] || { requests: 0, failed: 0, prompt: 0, cached: 0, completion: 0, costCny: 0 };
       const s = d.byProvider?.[id] || {};
       const merged = {};
-      for (const f of COUNTERS) merged[f] = num(s[f] ?? z[f] ?? 0);
+      for (const f of PROVIDER_COUNTERS) merged[f] = num(s[f] ?? z[f] ?? 0);
       day.byProvider[id] = merged;
     }
     // 口径自检：requests 必须等于三种结局之和。老账本里曾有过渡版本写歪过（多算几次），
@@ -382,6 +425,9 @@ function loadHistory() {
     if (day.requests !== split) log(`账本 ${k} 口径不一致：requests=${day.requests} 但 ok+failed+clientAborted=${split}（历史遗留，不改写）`);
     history.days[k] = day;
   }
+  if (backfilled) log(`账本 ${backfilled} 天缺 userRequests（该字段 2026-11-24 才加），按 requests 回填`);
+  // 回填要落盘，否则下次重启又从头算一遍（scheduleSave 是函数声明，声明位置在这里之后也没关系）
+  if (backfilled) scheduleSave();
   // 账本按天分桶，永远只增不减；一年就是 365 个桶，留着够看，再旧的就裁掉
   const keepDays = Number(process.env.ROUTER_STATS_KEEP_DAYS || 365);
   const keys = Object.keys(history.days).sort();
@@ -391,15 +437,31 @@ function loadHistory() {
 }
 
 let saveTimer = null;
+let dirty = false;
+
+/** 立即落盘（取消去抖）。退出前必须调一次，否则最后 1.5 秒的请求全丢。 */
+function flushSave() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  if (!dirty) return;
+  try {
+    // version 2：2026-11-24 起账本带 userRequests。升版本号是为了让「缺字段回填」只做一次
+    fs.writeFileSync(STATS_FILE, `${JSON.stringify({ version: 2, days: history.days }, null, 2)}\n`);
+    dirty = false;
+  } catch (err) {
+    // 写失败（磁盘满 / 被占用）时不要清脏标记，否则下一次去抖就不会再试了，账目静默丢失
+    log(`历史账本写入失败（保留待写状态，下次再试）：${err.message}`);
+  }
+}
+
 function scheduleSave() {
+  dirty = true;
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    try {
-      fs.writeFileSync(STATS_FILE, `${JSON.stringify({ version: 1, days: history.days }, null, 2)}\n`);
-    } catch (err) {
-      log(`历史账本写入失败：${err.message}`);
-    }
+    flushSave();
   }, 1500);
   if (saveTimer.unref) saveTimer.unref();
 }
@@ -408,7 +470,7 @@ function scheduleSave() {
  * 记一次「有结论的请求」进历史账本（成功、失败都算，客户端主动断开单独记）。
  * 以前只有成功分支调用它，于是 stats.json 里 failed 永远是 0 —— 看板看不见故障率。
  */
-function addToDay(day, { provider, usage, cost, ok = true, clientAborted = false }) {
+function addToDay(day, { provider, usage, cost, ok = true, clientAborted = false, userRequest = false }) {
   // 桶可能来自旧版本账本（没有 clientAborted 字段），undefined++ 会得到 NaN、
   // 再被 JSON.stringify 写成 null。所以每次拿桶都先和 zeroDay() 合一次 ——
   // byProvider 必须逐个 provider 深合，浅合会把整块 provider 换成没有新字段的旧对象。
@@ -420,9 +482,12 @@ function addToDay(day, { provider, usage, cost, ok = true, clientAborted = false
   }
   // 旧桶里可能是 null（历史上真写出过 "clientAborted": null），null++ 会变 1 但语义已丢，
   // 统一先归零再累加，账本才不会带着脏值往下滚。
-  for (const f of ['requests', 'ok', 'failed', 'clientAborted', 'prompt', 'cached', 'completion', 'costCny']) {
+  for (const f of ['userRequests', 'requests', 'ok', 'failed', 'clientAborted', 'prompt', 'cached', 'completion', 'costCny']) {
     if (!Number.isFinite(d[f])) d[f] = 0;
   }
+  // userRequest：这一笔是不是「用户新发起的一个请求」的第一跳。兜底那一跳不算，
+  // 否则一次提问会被记成两次。
+  if (userRequest) d.userRequests++;
   d.requests++;
   if (clientAborted) d.clientAborted++;
   else if (ok) d.ok++;
@@ -452,7 +517,7 @@ function sumDays(keys) {
   for (const k of keys) {
     const d = history.days[k];
     if (!d) continue;
-    for (const f of ['requests', 'ok', 'failed', 'clientAborted', 'prompt', 'cached', 'completion', 'costCny']) {
+    for (const f of ['userRequests', 'requests', 'ok', 'failed', 'clientAborted', 'prompt', 'cached', 'completion', 'costCny']) {
       t[f] += d[f] || 0;
     }
     for (const id of ['deepseek', 'ollama']) {
@@ -581,6 +646,9 @@ function clock(date = new Date()) {
   return `${WEEKDAY_CN[b.weekday]} ${pad(b.hours)}:${pad(b.mins)}`;
 }
 
+// 主日志一律走 stdout：常驻运行是 supervisor 把 stdout 重定向进 autostart/router-supervisor.log，
+// 由它负责轮转。ROUTER_LOG_FILE 只用于「进程退出」那一行（stdout 可能已经没了，
+// 退出记录只能直接写文件）。别在这里改成写 ROUTER_LOG_FILE，否则 supervisor 模式下会写两份。
 function log(msg) {
   const d = new Date();
   console.log(`[${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}] ${msg}`);
@@ -653,6 +721,42 @@ function sendJson(res, status, obj) {
 // ------------------------------------------------------------------ 上游调用
 
 /**
+ * 读上游的错误正文，但限时。返回字符串；超时/出错返回已经收到的部分（可能为空）。
+ * 不用 upstreamRes.text()：那个没有超时，上游发了响应头就撒手不管时会把请求挂死。
+ */
+async function readErrorBody(upstreamRes, ms) {
+  const reader = upstreamRes.body?.getReader();
+  if (!reader) return '';
+  const chunks = [];
+  let size = 0;
+  // 超时 promise 只建一次。以前放在循环里每轮新建一个，会在同一个 signal 上
+  // 挂一堆 listener（MaxListenersExceededWarning 的老毛病换个地方又犯一次）。
+  // finally 里 clearTimeout 之后它永远不会 reject，所以也不会有未处理的拒绝。
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`读错误正文超时（${ms}ms）`)), ms);
+  });
+  try {
+    while (size < 64 * 1024) {
+      const { done, value } = await Promise.race([reader.read(), timeout]);
+      if (done) break;
+      chunks.push(Buffer.from(value));
+      size += value.length;
+    }
+  } catch (err) {
+    log(`  上游错误正文没读完（${err?.message || err}），按已收到的 ${size} 字节处理`);
+  } finally {
+    clearTimeout(timer);
+    try {
+      await reader.cancel();
+    } catch {
+      /* 已经断了就没什么可取消的 */
+    }
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
  * 尝试一个上游。返回 { ok:true } 表示已经把响应（含流）写给客户端；
  * 返回 { ok:false, retryable, reason } 表示还没写任何字节，可以换一家重试。
  */
@@ -701,7 +805,12 @@ async function attemptOnce(upstream, payload, res, opts) {
   clearTimeout(timer); // 已拿到响应头，后续流式不再设整段超时
 
   if (!upstreamRes.ok) {
-    const text = await upstreamRes.text().catch(() => '');
+    // 这里必须自己限时：上面刚把「首字节」计时器撤了，而 idle 计时器要到流式循环才 arm，
+    // 中间是真空。上游完全可能回了 400 响应头、正文写一半就不结束，此时 await text()
+    // 会一直挂着——实测客户端要等 9 秒自己 abort，路由器连一条 ✗ 都来不及记。
+    // 用专门的上限（ROUTER_ERROR_BODY_TIMEOUT_MS，默认 15s）而不是 idleTimeout：
+    // 错误正文正常只有几百字节，没有理由等两分钟才判它读不完。
+    const text = await readErrorBody(upstreamRes, cfg.errorBodyTimeoutMs);
     // 读错误正文（429/5xx 的 JSON）期间客户端可能已经走了：这时既不能当上游失败记账，
     // 更不能接着去换另一家——那会再凭空生成一整段没人要的响应。
     if (isClientGone()) {
@@ -763,16 +872,24 @@ async function attemptOnce(upstream, payload, res, opts) {
   // 背压：res.write() 返回 false 表示内核缓冲区满了（客户端读得比上游吐得慢）。
   // 不理会它的话，整段响应会堆在进程内存里，慢客户端 + 长思考就能把路由器顶爆。
   // 等 'drain'，但客户端中途跑掉时 'drain' 永远不会来，所以同时等 'close'。
-  const waitDrain = () =>
-    new Promise((resolve) => {
+  // 注意：用 once 而不是 on。res 上的 'close' 监听器上限是 10，一个长时间的大响应
+  // 每遇到一次写满就挂两个监听器，累积到 11 个就冒 MaxListenersExceededWarning，
+  // 而且退出时清理不干净。这里在 settle 后把两个都摘掉，只留一个共用 promise。
+  let drainWait = null;
+  const waitDrain = () => {
+    if (drainWait) return drainWait;
+    drainWait = new Promise((resolve) => {
       const done = () => {
         res.off('drain', done);
         res.off('close', done);
+        drainWait = null;
         resolve();
       };
       res.once('drain', done);
       res.once('close', done);
     });
+    return drainWait;
+  };
   try {
     while (true) {
       armIdle();
@@ -833,13 +950,15 @@ async function upstreamBalance(id) {
   const u = cfg.upstreams[id];
   if (!u.key) return { ok: false, error: `未配置 ${id.toUpperCase()}_API_KEY` };
   const hit = balanceCache.get(id);
-  if (hit && Date.now() - hit.at < 60000) return hit.value;
+  if (hit && Date.now() - hit.at < cfg.balanceTtlMs) return hit.value;
   let value;
   try {
     const origin = new URL(u.base).origin;
+    // 3 秒：余额只是看板上的一个卡片，不值得让整页等它。以前串行 8+8 秒，
+    // 实测两家都卡死时打开看板要 16 秒，而页面还挂着 5 秒自动刷新。
     const r = await fetch(`${origin}${BALANCE_PATHS[id]}`, {
       headers: { authorization: `Bearer ${u.key}` },
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(cfg.balanceTimeoutMs),
     });
     const text = await r.text();
     let data;
@@ -856,10 +975,12 @@ async function upstreamBalance(id) {
   return value;
 }
 
-const allBalances = async () => ({
-  deepseek: await upstreamBalance('deepseek'),
-  ollama: await upstreamBalance('ollama'),
-});
+// 两家并行拉，别串行：串行时最坏耗时是两家超时之和（实测 8+8=16 秒），
+// 而看板每 5 秒自动刷新一次，浏览器会叠一堆挂着的请求。
+async function allBalances() {
+  const [deepseek, ollama] = await Promise.all([upstreamBalance('deepseek'), upstreamBalance('ollama')]);
+  return { deepseek, ollama };
+}
 
 // ------------------------------------------------------------------ 看板
 
@@ -882,16 +1003,23 @@ async function dashboardHtml() {
   const h = v.history;
   const bal = await allBalances();
   const money = (n) => `¥${Number(n).toFixed(6)}`;
+  // 上游的错误正文、模型名、余额错误串都是外部可控文本，直接拼进 HTML 会被当成标记。
+  // 实测上游回 {"message":"<img src=x onerror=...>"} 时看板里 onerror 原样存活。
+  // 这里统一转义，凡是往页面里插字符串的地方都过一遍。
+  const esc = (s) =>
+    String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const le = v.lastEffort;
-  const effortView = le ? (le.effort || (le.thinking === 'disabled' ? 'off' : '未指定')) : '还没有请求';
+  // le.effort / le.thinking / byEffort 的键都直接来自请求体（客户端可控），也要转义：
+  // 以前只有错误正文过了 esc()，这条路径漏着。
+  const effortView = esc(le ? le.effort || (le.thinking === 'disabled' ? 'off' : '未指定') : '还没有请求');
   const effortSub = le
-    ? `thinking=${le.thinking || '未带'} · ${cfg.upstreams[le.provider].label} · ${new Date(le.at).toLocaleTimeString('zh-CN', { hour12: false })}` +
-      `　各档累计：${Object.entries(v.byEffort).map(([k, n]) => `${k}×${n}`).join(' / ')}`
+    ? `thinking=${esc(le.thinking || '未带')} · ${esc(cfg.upstreams[le.provider]?.label ?? le.provider)} · ${new Date(le.at).toLocaleTimeString('zh-CN', { hour12: false })}` +
+      `　各档累计：${esc(Object.entries(v.byEffort).map(([k, n]) => `${k}×${n}`).join(' / '))}`
     : '在 DSH 里选一档推理等级，发一句话就能看到';
   const rows = Object.entries(v.byProvider)
     .map(
       ([id, s]) =>
-        `<tr><td>${cfg.upstreams[id].label}</td><td>${s.requests}${s.failed ? ` <span class="warn">失败 ${s.failed}</span>` : ''}</td><td>${s.prompt.toLocaleString()}</td>` +
+        `<tr><td>${esc(cfg.upstreams[id].label)}</td><td>${s.requests}${s.failed ? ` <span class="warn">失败 ${s.failed}</span>` : ''}</td><td>${s.prompt.toLocaleString()}</td>` +
         `<td>${s.cached.toLocaleString()}</td><td>${s.completion.toLocaleString()}</td><td>${money(s.costCny)}</td></tr>`,
     )
     .join('');
@@ -907,9 +1035,9 @@ async function dashboardHtml() {
       const one = cny || usd;
       dsCard = one
         ? { value: `${one.currency === 'CNY' ? '¥' : '$'}${Number(one.total_balance).toFixed(2)}`, sub: `充值 ${one.currency === 'CNY' ? '¥' : '$'}${Number(one.topped_up_balance ?? 0).toFixed(2)} · 赠送 ¥${Number(one.granted_balance ?? 0).toFixed(2)}` }
-        : { value: '—', sub: JSON.stringify(ds.data).slice(0, 60) };
+        : { value: '—', sub: esc(JSON.stringify(ds.data).slice(0, 60)) };
     } else {
-      dsCard = { value: '取不到', sub: String(ds?.error || `HTTP ${ds?.status}`) };
+      dsCard = { value: '取不到', sub: esc(String(ds?.error || `HTTP ${ds?.status}`)) };
     }
     let olCard;
     const inc = ol?.data?.included;
@@ -921,9 +1049,9 @@ async function dashboardHtml() {
           (inc.period?.until ? ` · 到 ${String(inc.period.until).slice(0, 10)}` : ''),
       };
     } else if (ol?.ok) {
-      olCard = { value: '—', sub: JSON.stringify(ol.data).slice(0, 60) };
+      olCard = { value: '—', sub: esc(JSON.stringify(ol.data).slice(0, 60)) };
     } else {
-      olCard = { value: '取不到', sub: String(ol?.error || `HTTP ${ol?.status}`) };
+      olCard = { value: '取不到', sub: esc(String(ol?.error || `HTTP ${ol?.status}`)) };
     }
     return { deepseek: dsCard, ollama: olCard };
   })();
@@ -939,7 +1067,7 @@ async function dashboardHtml() {
     return `<td>${s.requests || 0} 次${bad}<br><span class="dim">${tok(tk)} token</span><br>${money(s.costCny || 0)}</td>`;
   };
   const upRows = Object.keys(cfg.upstreams)
-    .map((id) => `<tr><td>${cfg.upstreams[id].label}</td>${periods.map(([, t]) => cellOf(t, id)).join('')}</tr>`)
+    .map((id) => `<tr><td>${esc(cfg.upstreams[id].label)}</td>${periods.map(([, t]) => cellOf(t, id)).join('')}</tr>`)
     .join('');
   const upTotal = `<tr><td>合计</td>${periods
     .map(([, t]) => {
@@ -950,14 +1078,18 @@ async function dashboardHtml() {
       const aborted = t.clientAborted > 0
         ? `<span class="dim" title="客户端（DSH）主动取消的请求，上游已随之中止，不是路由器故障"> · 断开 ${t.clientAborted}</span>`
         : '';
-      return `<td>${t.requests} 次<br><span class="dim">${tok(t.tokens.input + t.tokens.output)} token</span><br>${money(t.costCny)}${aborted}${bad}</td>`;
+      // 首行是「用户问了几次」，不是「打了几次上游」：首选失败兜底成功时，
+      // 后者会是前者的两倍，看板上会变成「我问了一句话，怎么显示 2 次」。
+      const userN = t.userRequests ?? t.requests;
+      const tries = t.requests > userN ? `<br><span class="dim" title="一次提问可能先试失败一家再兜底成功，这里记的是上游尝试次数">上游尝试 ${t.requests} 次</span>` : '';
+      return `<td>${userN} 次<br><span class="dim">${tok(t.tokens.input + t.tokens.output)} token</span><br>${money(t.costCny)}${aborted}${bad}${tries}</td>`;
     })
     .join('')}</tr>`;
   // 每家花了多少：只列真正有请求的那几家
   const split = (t) =>
     Object.entries(t.byProvider || {})
       .filter(([, s]) => s?.requests)
-      .map(([id, s]) => `${cfg.upstreams[id]?.label ?? id} ${s.requests} 次 ${money(s.costCny)}`)
+      .map(([id, s]) => `${esc(cfg.upstreams[id]?.label ?? id)} ${s.requests} 次 ${money(s.costCny)}`)
       .join(' · ');
   // 最近请求：聚合数字回答不了「刚才那条为什么失败」，这里给个短列表
   const recentRows = recent
@@ -975,8 +1107,8 @@ async function dashboardHtml() {
       const tk = (e.prompt ?? 0) + (e.completion ?? 0);
       const detail = e.ok
         ? `${tok(tk)} · ${money(e.costCny || 0)}`
-        : `<span class="dim">${String(e.reason || '').slice(0, 70)}</span>`;
-      return `<tr><td>${hhmm}</td><td>${e.upstream}</td><td>${result}</td><td>${e.ms ?? ''}ms</td><td>${detail}</td></tr>`;
+        : `<span class="dim">${esc(String(e.reason || '').slice(0, 70))}</span>`;
+      return `<tr><td>${hhmm}</td><td>${esc(e.upstream)}</td><td>${result}</td><td>${e.ms ?? ''}ms</td><td>${detail}</td></tr>`;
     })
     .join('');
   return `<!doctype html>
@@ -1011,7 +1143,7 @@ async function dashboardHtml() {
     · <a href="/_router/prefer?prefer=auto-ollama">自动·以 Ollama 空闲为准</a>
     · <a href="/_router/prefer?prefer=ollama">强制 Ollama</a>
     · <a href="/_router/prefer?prefer=deepseek">强制官方</a></p>
-  <p class="now">${cfg.upstreams[p.provider].label}<small>模型 ${cfg.upstreams[p.provider].model} · ${p.reason}</small></p>
+  <p class="now">${esc(cfg.upstreams[p.provider].label)}<small>模型 ${esc(cfg.upstreams[p.provider].model)} · ${esc(p.reason)}</small></p>
   <div class="grid">
     <div class="card"><span class="lbl">北京时间</span><b>${clock(at)}</b>
       <span class="sub">下次切换：${next.text}</span>
@@ -1020,7 +1152,7 @@ async function dashboardHtml() {
     <div class="card"><span class="lbl">推理档位（最近一次请求）</span><b>${effortView}</b>
       <span class="sub">${effortSub}</span></div>
     <div class="card"><span class="lbl">本次运行 · 花费</span><b>${money(v.actualCny)}</b>
-      <span class="sub">${v.requests} 次请求${v.probeCny > 0 ? `，另有测试 ${v.probeRequests} 次 ${money(v.probeCny)}` : ''}</span>
+      <span class="sub">${v.userRequests} 次请求${v.requests > v.userRequests ? `（上游尝试 ${v.requests} 次）` : ''}${v.probeCny > 0 ? `，另有测试 ${v.probeRequests} 次 ${money(v.probeCny)}` : ''}</span>
       <span class="sub">${split({ byProvider: v.byProvider })}</span></div>
     <div class="card"><span class="lbl">本次运行 · token</span><b>${tok(v.tokens.input + v.tokens.output)}</b>
       <span class="sub">${tokLine(v.tokens)}</span></div>
@@ -1037,13 +1169,13 @@ async function dashboardHtml() {
   <h2>用了多少 / 花了多少</h2>
   <div class="grid">
     <div class="card"><span class="lbl">今日（北京）</span><b>${money(h.today.costCny)}</b>
-      <span class="sub">${h.today.requests} 次 · ${tokLine(h.today.tokens)}</span>
+      <span class="sub">${h.today.userRequests ?? h.today.requests} 次 · ${tokLine(h.today.tokens)}</span>
       <span class="sub">${split(h.today)}</span></div>
     <div class="card"><span class="lbl">近 7 天</span><b>${money(h.last7.costCny)}</b>
-      <span class="sub">${h.last7.requests} 次 · ${tokLine(h.last7.tokens)}</span>
+      <span class="sub">${h.last7.userRequests ?? h.last7.requests} 次 · ${tokLine(h.last7.tokens)}</span>
       <span class="sub">${split(h.last7)}</span></div>
     <div class="card"><span class="lbl">累计（含以往运行）</span><b>${money(h.total.costCny)}</b>
-      <span class="sub">${h.total.requests} 次 · ${tokLine(h.total.tokens)}</span>
+      <span class="sub">${h.total.userRequests ?? h.total.requests} 次 · ${tokLine(h.total.tokens)}</span>
       <span class="sub">${split(h.total)}</span></div>
   </div>
 
@@ -1130,8 +1262,12 @@ async function modeSnapshot() {
     `ollamaBalance=${olText}`,
     `ollamaAllowance=${inc ? Number(inc.allowance_usd).toFixed(0) : ''}`,
     `ollamaUntil=${inc?.period?.until ? String(inc.period.until).slice(0, 10) : ''}`,
-    `todayRequests=${h.today.requests}`,
+    // todayRequests 是「用户问了几次」，与看板合计行同口径；兜底重试多打的那一次
+    // 记在 todayTries 里（托盘不显示，排查时用）。
+    `todayRequests=${h.today.userRequests}`,
+    `todayTries=${h.today.requests}`,
     `todayCostCny=${Number(h.today.costCny).toFixed(4)}`,
+    `userRequests=${stats.userRequests}`,
     `requests=${stats.requests}`,
     `failed=${stats.failed}`,
     `clientAborted=${stats.clientAborted}`,
@@ -1250,6 +1386,18 @@ async function handle(req, res) {
     return sendJson(res, 400, { error: { message: '请求体不是合法 JSON' } });
   }
 
+  // 老版 /v1/completions 传的是 prompt（字符串或字符串数组），不是 messages。
+  // 以前原样转发到上游的 /chat/completions，上游收不到 messages 只会报错。
+  // 这里就地转成一条 user 消息，让这条路真的能用。
+  if (body && !Array.isArray(body.messages)) {
+    const p = body.prompt;
+    const text = Array.isArray(p) ? p.join('\n') : typeof p === 'string' ? p : null;
+    if (text !== null) {
+      body = { ...body, messages: [{ role: 'user', content: text }] };
+      delete body.prompt;
+    }
+  }
+
   const force = String(req.headers['x-router-force'] || url.searchParams.get('force') || '').toLowerCase();
   const decision = choose(force === 'deepseek' || force === 'ollama' ? force : null);
 
@@ -1275,7 +1423,10 @@ async function handle(req, res) {
       `${guard ? `（原 ${guard.from} 已抬升）` : ''}  msgs=${Array.isArray(body.messages) ? body.messages.length : 0}`,
   );
 
-  for (const id of order) {
+  for (const [hop, id] of order.entries()) {
+    // hop === 0 才是「用户新发起的请求」；后面的是兜底重试，不能重复计进 userRequests
+    // 注意别叫 first：外层 first 是「首选 provider」，fallback 判定还在用它
+    const isFirst = hop === 0;
     const upstream = cfg.upstreams[id];
     const payload = Buffer.from(
       JSON.stringify({ ...body, model: mapModel(body.model, upstream) }),
@@ -1283,7 +1434,7 @@ async function handle(req, res) {
     const result = await attempt(upstream, payload, res);
     if (result.clientGone) {
       // 客户端自己走了：不算失败、不换家（它已经收不到任何东西了），只留一条日志
-      recordClientAbort({ provider: id, probe: decision.forced === true });
+      recordClientAbort({ provider: id, probe: decision.forced === true, first: isFirst });
       log(`⊘ ${upstream.label}  客户端断开，已中止上游（${result.ms}ms）`);
       pushRecent({
         at: new Date().toISOString(),
@@ -1304,6 +1455,7 @@ async function handle(req, res) {
       const usage = normalizeUsage(result.usage);
       const r = record({
         provider: id,
+        first: isFirst,
         tier: id === 'deepseek' ? dsTier : olTier,
         dsTier,
         usage,
@@ -1335,7 +1487,7 @@ async function handle(req, res) {
       });
       return;
     }
-    recordFailure({ provider: id, probe: decision.forced === true });
+    recordFailure({ provider: id, probe: decision.forced === true, first: isFirst });
     log(`✗ ${upstream.label}  ${result.reason}`);
     pushRecent({
       at: new Date().toISOString(),
@@ -1369,7 +1521,7 @@ async function handle(req, res) {
     }
     if (res.destroyed) {
       // 客户端在「上一家失败、下一家还没发」的空档断开：别再去打下一家，白烧一次上游调用
-      recordClientAbort({ provider: id, probe: decision.forced === true });
+      recordClientAbort({ provider: id, probe: decision.forced === true, first: isFirst });
       log('⊘ 客户端已断开，不再重试下一家');
       return;
     }
@@ -1423,8 +1575,11 @@ server.on('error', (err) => {
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     console.log('\n正在关闭...');
+    // 先把还没落盘的账写掉：去抖窗口是 1.5 秒，supervisor 重启 / 手动杀进程
+    // 经常正好落在这个窗口里，实测会整条丢掉（统计少一次、少一笔花费）。
+    flushSave();
     server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2000);
+    setTimeout(() => process.exit(0), 2000).unref();
   });
 }
 
@@ -1436,6 +1591,12 @@ process.on('unhandledRejection', (err) => {
   log(`未处理的 Promise 拒绝（进程继续）：${err?.stack || err}`);
 });
 process.on('exit', (code) => {
+  // 兜底：任何路径退出（含未捕获异常导致的）都要把账本写完
+  try {
+    flushSave();
+  } catch {
+    /* 退出时尽力而为 */
+  }
   try {
     fs.appendFileSync(
       process.env.ROUTER_LOG_FILE || path.join(HERE, 'router.log'),

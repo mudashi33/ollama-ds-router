@@ -1,5 +1,84 @@
 # 变更记录
 
+## 2026-11-24 — 体检修掉 9 个问题（错误正文限时 / 护栏双字段 / 看板转义 / 余额并行 / 用户请求数 / 落盘兜底）
+
+### 为什么要体检
+用户问「再检查一遍还有没有 bug」。用 15 个真实探针（不是读代码猜）压了一遍：
+假上游、真实 abort、慢流、半截错误正文、RST、XSS payload、两家余额同时挂死、
+SIGTERM 落盘窗口、MaxListeners、老版 completions 接口。压出 5 个真 bug + 4 个次要问题，全部修掉。
+
+### 逐条
+
+**1. 读上游错误正文没有超时（真 bug，最严重）**
+`attemptOnce()` 拿到响应头后立刻 `clearTimeout(timer)` 撤掉首字节计时器，而 idle 计时器要到
+流式循环才 arm —— 中间是真空。上游完全可能回了 `400` 响应头、正文写一半就不结束，
+此时 `await upstreamRes.text()` 会一直挂着。实测：客户端等了 9011ms 自己 abort，
+期间路由器一条 `✗` 都没写。
+修：新增 `readErrorBody(upstreamRes, ms)`，用 `Promise.race` 加超时读完即取消，
+上限走新的 `ROUTER_ERROR_BODY_TIMEOUT_MS`（默认 15s；错误正文正常只有几百字节，
+没有理由跟 `ROUTER_IDLE_TIMEOUT_MS` 的 120s 一起等），超时按已收到的部分处理并记一行日志。
+
+**2. `applyMaxTokensGuard` 命中第一个字段就 return（真 bug）**
+原写法 `for (const field of ['max_tokens','max_completion_tokens'])` 里第一次命中就
+`return`。OpenAI 系上游里 `max_completion_tokens` 优先级高于 `max_tokens`，
+所以同时发 `{max_tokens:1, max_completion_tokens:1}` 时只改了前者，上游照旧只吐 1 个 token。
+另外 `max_tokens:"1"`（字符串）因 `typeof v !== 'number'` 被 `continue`，原样透传。
+修：两个字段都过一遍，字符串形式用 `Number(raw)` 认；`stats.maxTokensGuard.last.fields`
+记下这次到底改了哪几个。回归用例验 `"1"` 会被抬、`"256000"` 不误抬。
+
+**3. 看板把上游文本直拼进 HTML（真 bug，XSS）**
+`recent` 行把 `e.reason` 用 `String(...).slice(0,70)` 直接插进 HTML；同病还有 `cellOf`、
+`e.upstream`、余额卡的 `sub`、`p.reason`。实测上游回
+`{"error":{"message":"<img src=x onerror=\"document.title=1\">"}}` 时 `onerror` 在看板里原样存活。
+修：`dashboardHtml()` 里加 `esc()`（`& < > " '` 五个字符），所有插值点统一过一遍。
+
+**4. 两家余额串行拉，看板被拖死（真 bug）**
+`allBalances` 原本 `{deepseek: await ..., ollama: await ...}`，每家 `AbortSignal.timeout(8000)`
+→ 两家都挂死时最坏 16 秒；而看板页面挂着 `<meta http-equiv="refresh" content="5">`，
+浏览器会一直叠挂着的请求。
+修：`Promise.all` 并行；单家超时降到 3 秒（新增 `ROUTER_BALANCE_TIMEOUT_MS`），
+缓存时间提取成 `ROUTER_BALANCE_TTL_MS`（默认 60000）。回归用例：两家都挂死时 `GET /` < 3.5s。
+
+**5. `requests` 记的是上游尝试次数，不是用户请求数（语义 bug）**
+一次提问首选失败 + 兜底成功 → `requests=2 ok=1 failed=1 fallbacks=1`，看板显示
+「2 次 / 失败 1」。口径自检 `requests=ok+failed+clientAborted` 仍为 true（内部自洽），
+但用户看到的是「我就问了一句，怎么算了两次」。
+修：新增并行的 `userRequests` 维度（只数用户真正发起的请求，兜底那跳不算），
+`record()` / `recordFailure()` / `recordClientAbort()` 都接受 `first`；
+`addToDay()` / `zeroDay()` / `sumDays()` / `loadHistory()` 的 COUNTERS 全带上它；
+看板合计行的首行改显示 `userRequests`，两者不同时才补一行灰字「上游尝试 N 次」。
+`test-local.mjs` 断言：一次兜底成功 → `requests +2`、`userRequests +1`。
+
+**6. `waitDrain()` 泄漏 `close` 监听器（次要）**
+每遇写满就挂一对新监听器，大响应累积 11+ 会冒 `MaxListenersExceededWarning`。
+修：共用一个 `drainWait` promise，settle 后把两个监听器都摘掉。
+
+**7. `/v1/completions` 被当 chat 转发（次要）**
+老版接口 body 是 `prompt`（字符串或字符串数组），原样转发到上游 `/chat/completions`
+上游收不到 `messages` 只会报错。修：就地转成一条 user 消息，删掉 `prompt`。
+
+**8. 退出时丢最后一笔账（次要）**
+落盘有 1500ms 去抖，`SIGTERM` 正好落进窗口就整条丢。修：提取 `flushSave()`，
+`SIGINT`/`SIGTERM` handler 与 `process.on('exit')` 都刷一次；去抖定时器加 `.unref()`。
+回归用例在 Windows 上有坑：`child.kill('SIGTERM')` 是 `TerminateProcess`，handler 根本不跑，
+所以新增 `tools/test-sigterm-wrapper.mjs`，在进程内 `process.emit('SIGTERM')` 走同一条分支。
+
+**9. `ROUTER_LOG_FILE` 语义误导（次要）**
+文档写成「日志路径」，实际常驻运行时 `log()` 只往 stdout 写（supervisor 重定向进
+`autostart/router-supervisor.log`），`ROUTER_LOG_FILE` 只用于「进程退出」那一行。
+修：代码注释和 README 都说清，不再让人以为改它就能换日志位置。
+
+### 测试
+`node test-local.mjs` **23 → 35 项，35/35 通过**。新增覆盖：错误正文不结束不挂死（< 20s）、
+XSS 转义、余额并行（两家都挂死 < 3.5s）、`userRequests` 口径与落盘、SIGTERM 刷盘、
+`waitDrain` 不泄漏、老版 completions 转 messages、护栏双字段与字符串形式。
+`node schedule.mjs --test` 13/13 + 节假日；`node tools/test-log-rotate.mjs` 6/6。
+
+### 顺手
+`.env.example` 补 `ROUTER_ERROR_BODY_TIMEOUT_MS` / `ROUTER_BALANCE_TIMEOUT_MS` / `ROUTER_BALANCE_TTL_MS`，
+变量总数 27 → **30**（router 23 + 守护 9，去重后 30）；README 文件表补
+`tools/test-sigterm-wrapper.mjs`。
+
 ## 2026-11-24 — 看板：客户端断开降级显示，不再顶红字
 
 ### 为什么改

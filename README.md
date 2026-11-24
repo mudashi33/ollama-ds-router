@@ -172,7 +172,7 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `schedule.mjs` | 纯时间规则，无网络依赖；`node schedule.mjs --test` 跑边界用例 |
 | `router.mjs` | 本地 OpenAI 兼容代理，按规则转发 + 失败回退 + 用量记账 |
 | `probe.mjs` | 两家 API 的兼容性冒烟测试（tools / 流式 / 缓存） |
-| `test-local.mjs` | 用假上游回归测试路由逻辑（23 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径/看板渲染），不联网不花钱 |
+| `test-local.mjs` | 用假上游回归测试路由逻辑（35 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径/看板渲染/错误正文限时/余额并行/SIGTERM 落盘），不联网不花钱 |
 | `holidays.json` | 中国法定节假日表（这些天 DeepSeek 全天空闲，路由全天走官方）；已含 2027 全年，改后自动重载 |
 | `stats.json` | 按北京日期累计的用量账本，自动生成；删掉即清零 |
 | `setup.mjs` / `setup.cmd` | 一键部署：找回 key、验证、写 `.env`、装自启、启动、查 DSH 配置 |
@@ -185,8 +185,9 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `tray\RouterTray.exe` | 托盘小工具（C++ 单文件，**已编好入库**，182 KB / x86 静态 CRT / Win7–Win11 免安装）：切模式、看余额、看两家高峰期；`--tray` 启动即隐藏窗口 |
 | `tools\supervisor.mjs` | 守护进程：端口探活 → 起 router → 连续 3 次健康检查失败就重启 → 日志按大小/天数轮转（copytruncate） |
 | `tools\test-log-rotate.mjs` | 日志轮转的回归测试（`node tools/test-log-rotate.mjs`，6 个断言，不联网、不碰 8788） |
+| `tools\test-sigterm-wrapper.mjs` | 测试用外壳：在进程内 `process.emit('SIGTERM')`，用来验「收到信号先把账本刷下去」（Windows 上 `child.kill('SIGTERM')` 是硬杀，handler 跑不到） |
 | `autostart\` | 计划任务 `Ollama-DS-Router` 的入口：`router-hidden.vbs` → `tools\supervisor.mjs`（守护：崩了 5 秒拉起、每 30 秒探活） |
-| `.env.example` | 全部 27 个环境变量的模板（必填只有两个 key） |
+| `.env.example` | 全部 30 个环境变量的模板（必填只有两个 key） |
 
 ## 一键部署（推荐）
 
@@ -259,7 +260,7 @@ node probe.mjs
 
 ```powershell
 node schedule.mjs --test        # 时间规则边界（13 项）
-node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 记账（23 项）
+node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 记账（35 项）
 node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 ```
 
@@ -435,6 +436,26 @@ DSH 里按 Esc 取消、关窗口、或者网络断了，代理会跟着把上�
 
 守护自己的日志（`autostart/router-supervisor.log`）和 router 的 stdout 是同一个文件；
 `router.log` 只记进程启动/退出这两行，别在它里面找请求记录。
+
+### 一次体检修掉的 9 个问题（2026-11-24）
+
+15 个真实探针压出来的，逐条都在 `test-local.mjs` 里有回归用例：
+
+| 问题 | 症状 | 修法 |
+|---|---|---|
+| 读错误正文没有超时 | 上游回 400 响应头、正文写一半不结束 → 请求挂死 9 秒，连一条 `✗` 都来不及记（首字节计时器已撤、idle 计时器还没 arm，中间是真空） | 新增 `readErrorBody(upstreamRes, ms)`：用 `Promise.race` 限时读，超时按已收到的部分处理；上限是新的 `ROUTER_ERROR_BODY_TIMEOUT_MS`（默认 15s） |
+| `max_tokens` 护栏只看第一个字段 | 同时发 `max_tokens:1` 和 `max_completion_tokens:1` 时只改了前者，上游按后者照旧只吐 1 个 token | 两个字段都过一遍；`"1"` 这种字符串形式也认 |
+| 看板直接拼上游文本 | 上游回 `{"message":"<img src=x onerror=...>"}` 时脚本会在看板里执行 | 所有插值统一过 `esc()`（`& < > " '`） |
+| 两家余额串行拉 | 两家都卡死时 `GET /` 要 16 秒，而页面每 5 秒自动刷新一次 → 浏览器叠一堆挂着的请求 | 改 `Promise.all` 并行；单家超时 8s → 3s（`ROUTER_BALANCE_TIMEOUT_MS`），缓存 60s（`ROUTER_BALANCE_TTL_MS`） |
+| 请求数记的是上游尝试数 | 首选失败 + 兜底成功 → 看板显示「2 次 / 失败 1」，用户以为一句话被算了两次 | 新增 `userRequests`（只数用户真正发起的，兜底那跳不算）；`requests` 保留为上游尝试数，两者不同时才在看板上补一行灰字「上游尝试 N 次」 |
+| `waitDrain` 泄漏监听器 | 大响应每写满一次挂两个 `close` 监听器，累积 11 个就冒 `MaxListenersExceededWarning` | 共用一个 promise，settle 后摘干净 |
+| `/v1/completions` 被当 chat 转发 | 老版接口传的是 `prompt`，上游收不到 `messages` 只会报错 | 就地转成一条 user 消息再转发 |
+| 退出时丢最后一笔账 | 落盘有 1.5 秒去抖，`SIGTERM` 正好落在窗口里就整条丢掉 | 新增 `flushSave()`，`SIGINT`/`SIGTERM` 与 `process.on('exit')` 都刷一次 |
+| `ROUTER_LOG_FILE` 语义误导 | 文档写成「日志路径」，但常驻运行时全走 stdout（supervisor 重定向） | 代码注释与文档说清：它只用于「进程退出」那一行，请求日志看 `autostart/router-supervisor.log` |
+
+计数口径不变，仍是 `requests = ok + failed + clientAborted`（上游尝试维度），
+`userRequests` 是并列的用户请求维度，不看上游尝试。
+
 
 ## 出问题时
 

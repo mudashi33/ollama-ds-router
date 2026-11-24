@@ -32,7 +32,8 @@
 
 2) 自检（三条全绿才能继续）
    node schedule.mjs --test       → 期望 13/13 PASS
-   node test-local.mjs            → 期望 23/23 PASS（旧版是 21/21，多了护栏边界 + 看板渲染两条用例）
+   node test-local.mjs            → 期望 35/35 PASS（旧版是 23/23，多了错误正文限时、看板转义、余额并行、
+                                    userRequests 口径、SIGTERM 落盘、drain 监听器、老版 completions 等用例）
    node tools/test-log-rotate.mjs → 期望 6/6 PASS（这个文件是新增的）
    任何一条失败：把完整报错贴给我，不要继续，也不要自己改测试。
 
@@ -47,7 +48,8 @@
    - 没有 supervisor：直接跑仓库里的 restart.cmd。
    验证：
    curl http://127.0.0.1:8788/_router/status   → HTTP 200
-   curl http://127.0.0.1:8788/_router/stats    → 能看到 clientAborted 字段（新字段，没有说明还是老代码）
+   curl http://127.0.0.1:8788/_router/stats    → 能看到 clientAborted 与 userRequests 字段
+                                                  （后者是 2026-11-24 新增，没有说明还是老代码）
    重启瞬间在途请求会断一次，这是正常的。
 
 4) 更新 DSH 里的模型参数（旧配置有两个隐患）
@@ -70,10 +72,13 @@
    curl http://127.0.0.1:8788/_router/recent → 最新一条 ok:true，带 provider / ms / prompt
 
 6) 可选：补 .env 里的新变量（不补也能跑，都有默认值）
-   把 .env 里已有的键名和 .env.example 对比，缺的只有下面三个，按需追加：
+   把 .env 里已有的键名和 .env.example 对比，按需追加（都有默认值，不追加也能跑）：
    ROUTER_GUARD_MAX_TOKENS=128000    # max_tokens 被 DSH 钳成 1 时抬到多少；=0 关闭
    ROUTER_GUARD_MIN_MSGS=20          # 少于这么多条消息不启用护栏
    ROUTER_LOG_MAX_AGE_DAYS=7         # 守护日志超过几天就轮转
+   ROUTER_ERROR_BODY_TIMEOUT_MS=15000  # 读上游错误正文的上限（默认 15 秒）
+   ROUTER_BALANCE_TIMEOUT_MS=3000    # 看板拉余额的单家超时（默认 3 秒）
+   ROUTER_BALANCE_TTL_MS=60000       # 余额缓存多久（默认 60 秒）
    注意：改完 .env 要重做第 3 步的重启才生效。不要打印任何 key 的值。
 
 交付报告请包含：
@@ -95,7 +100,9 @@
 | 客户端断开即中止上游 | 按 Esc 取消后上游立刻停，不再继续生成计费；这类请求记成「客户端断开」，不算失败 |
 | 失败进账本 | 看板/账本里的失败数不再永远是 0；口径固定为 `requests = ok + failed + clientAborted` |
 | 日志轮转 | 守护日志超过 5MB 或 7 天自动轮转（copytruncate，不再出现写满磁盘的老问题） |
-| 测试 21 项 → 23 项 | 新增「刚好等于护栏值时不抬」边界用例、「看板把客户端断开降成灰字」用例 |
+| 测试 23 项 → 35 项 | 新增错误正文限时、看板转义、余额并行、userRequests 口径、SIGTERM 落盘、drain 监听器、老版 completions 等用例 |
+| 修掉 9 个问题 | 错误正文不再挂死请求、护栏认 `max_completion_tokens` 与字符串、看板不再执行上游脚本、余额并行拉（最坏 16s → 3s）、看板次数改显示「用户问了几次」、退出不再丢最后一笔账 |
+| 账本字段 | 新增 `userRequests`（用户真正问了几次，不含兜底重试）；旧账本首次启动自动回填并升到 version 2 |
 | 看板合计行 | 「客户端断开 N」由红字改成灰色小字「断开 N」，真故障「失败 N」仍是红字 |
 
 ## 更新前自己确认一件事

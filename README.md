@@ -114,8 +114,8 @@ models:
     contextWindow: 1000000
     # 输出预算别照着窗口开满：DSH 会把「窗口 - 4096」当可用的输入余量，
     # maxTokens 一大就更容易被判成「上下文双超限」（实测 35 次 400 里有 31 次是这个）。
-    # 现在这台机器上是 150000，实测下发 128000。
-    maxTokens: 150000
+    # 现在这台机器上是 128000，和路由器的护栏值一致。
+    maxTokens: 128000
     input: [text, image]
     # 四档都要写全：DSH 把没声明的档位钉成 null（= 不支持），漏了 low 菜单里就没有低档。
     # 曾经真丢过 low（线上 cordis.patch.yml 只剩 off/high/max），两家上游其实都认 low。
@@ -279,7 +279,7 @@ node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
           - id: auto
             name: DeepSeek V4.1 Flash (自动选更便宜的一家)
             contextWindow: 1000000
-            maxTokens: 150000   # 别开满窗口，见「图片与推理档位」里的说明
+            maxTokens: 128000   # 别开满窗口，见「图片与推理档位」里的说明
             input: [text, image]
             reasoningEfforts: {off: null, low: low, high: high, max: max}   # 四档一个都不能少
             compat: {thinkingFormat: deepseek, maxTokensField: max_tokens,
@@ -372,18 +372,18 @@ node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 
 | 环境变量 | 默认 | 作用 |
 |---|---|---|
-| `ROUTER_GUARD_MAX_TOKENS` | `126000` | 低于此值的 `max_tokens` 会被抬到这里（126k）；`0` 关闭护栏 |
+| `ROUTER_GUARD_MAX_TOKENS` | `128000` | 低于此值的 `max_tokens` 会被抬到这里（128k）；`0` 关闭护栏 |
 | `ROUTER_GUARD_MIN_MSGS` | `20` | 只对消息数达到此值的请求生效（保护探活 / 短对话） |
 
-护栏值为什么是 126k 而不是刚好够用的 8192：被钳坏的请求本该拿到你配置的输出预算
-（`maxTokens: 150000`），抬到 8192 只是「够写一段」，模型真写满 8192 还是会撞
-`finish_reason=length`，客户端照样显示「已达到输出 token 上限」。实测 124 次抬升里
-有 4 次（3%）正好写满 8192。而真实输入并不需要省这点空间：全量日志里成功请求的真实
-输入 p50=122k / p95=182k / p99=199k / max=229k，229k + 126k = 355k，离 1M 窗口还很远；
-历史上 29 次「上下文超窗」400 报出的 prompt 全在 111 万以上，没有一条落在
-「126k 会 400 而 8192 不会」的中间带。
+护栏值和 DSH 侧 `models[].maxTokens` 保持一致（都是 128k），理由：被钳坏的请求本该拿到
+你配置的输出预算，抬到一个「够写一段」的小值（初版是 8192）没有意义 —— 模型真写满
+8192 还是会撞 `finish_reason=length`，客户端照样显示「已达到输出 token 上限」。实测
+124 次抬升里有 4 次（3%）正好写满 8192。而真实输入并不需要省这点空间：全量日志里成功
+请求的真实输入 p50=122k / p95=182k / p99=199k / max=229k，229k + 128k = 357k，离 1M
+窗口还很远；历史上 29 次「上下文超窗」400 报出的 prompt 全在 111 万以上，没有一条落在
+「128k 会 400 而 8192 不会」的中间带。
 
-命中时 `router.log` 写 `max_tokens=126000（原 1 已抬升）`，`/_router/stats` 的
+命中时 `router.log` 写 `max_tokens=128000（原 1 已抬升）`，`/_router/stats` 的
 `maxTokensGuard.hits` 会计数，`/_router/recent` 每条也带 `maxTokens` / `maxTokensOriginal`。
 抬升后若真实输入确实超长，上游回 400 上下文超长并原样透传给客户端，DSH 据此压缩。
 

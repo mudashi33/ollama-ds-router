@@ -1,35 +1,40 @@
 # 变更记录
 
-## 2026-11-24 — max_tokens 护栏下限 8192 → 126000
+## 2026-11-24 — max_tokens 护栏下限 8192 → 128000（128k）
 
 ### 为什么改
-2026-11-22 的初版护栏把「被 DSH 钳成 1 的输出预算」抬回 8192。用户反馈：明明配的是
-`maxTokens: 150000`，长会话里最大输出却变成 8192 —— 因为护栏抬到 8192 之后，模型真的
-按 8192 生成了，写满就被上游回 `finish_reason=length`，客户端照样显示「已达到输出 token 上限」。
+2026-11-22 的初版护栏把「被 DSH 钳成 1 的输出预算」抬回 8192。用户反馈：明明配了 128k，
+长会话里最大输出却变成 8192 —— 因为护栏抬到 8192 之后，模型真的按 8192 生成了，写满就被
+上游回 `finish_reason=length`，客户端照样显示「已达到输出 token 上限」。
 
 实测数据（`autostart/router-supervisor.log` 全量）：
 - 124 次护栏抬升中，**4 次输出正好写满 8192**（3%），平均输出 1828 token。
 - 被抬升那批请求的真实输入只有 77k~93k，占 1M 窗口的 7~9% —— 远没到需要省预算的地步。
 - 成功请求的真实输入分布：p50=122k / p95=182k / p99=199k / max=229k。
 - 历史 29 次「上下文超窗」400 报出的真实 prompt 全在 111 万~147 万，**没有一条**落在
-  「126k 会 400 而 8192 不会」的中间带。229k + 126k = 355k，离 1M 还很远。
+  「128k 会 400 而 8192 不会」的中间带。229k + 128k = 357k，离 1M 还很远。
 
 ### 改动
-- `router.mjs`：`GUARD_MAX_TOKENS` 默认值 `8192` → **`126000`**，注释重写为「恢复本该有的
-  输出预算」并附上上述实测数据。判断条件 `max_tokens < 126000` 不变，只动被钳坏的值。
-- `test-local.mjs`：断言从 8192 改成 126000，并新增一条边界用例「刚好等于 126000 时不抬」。
+- `router.mjs`：`GUARD_MAX_TOKENS` 默认值 `8192` → **`128000`**，注释重写为「恢复本该有的
+  输出预算」并附上上述实测数据。判断条件 `max_tokens < 128000` 不变，只动被钳坏的值。
+  这个值与 DSH 侧 `models[].maxTokens` 保持一致（同一个数，正常请求与被抬升后的请求
+  拿到同样的输出预算）。
+- `test-local.mjs`：断言从 8192 改成 128000，并新增一条边界用例「刚好等于 128000 时不抬」。
   测试数 **21 → 22**，`node test-local.mjs` 22/22 通过。
-- `tools/verify-guard.mjs`：期望值改为常量 `GUARD_TO`（读 `ROUTER_GUARD_MAX_TOKENS`，默认 126000），
+- `tools/verify-guard.mjs`：期望值改为常量 `GUARD_TO`（读 `ROUTER_GUARD_MAX_TOKENS`，默认 128000），
   不再写死 8192。
-- `.env.example` / `UPDATE-other-pc.md`：同步新默认值与理由。
+- `.env.example` / `UPDATE-other-pc.md` / `INSTALL-other-pc.md` / `README.md`：同步新默认值与理由，
+  示例配置里的 `maxTokens` 也统一成 128000。
+- `tools/test-log-rotate.mjs`：修掉一条时间相关的假红断言 —— 原来写死「日志里必须出现
+  `→ deepseek`」，但北京时间落进 DeepSeek 高峰时会自动走 Ollama，这条必然失败。改成
+  `/→ (deepseek|ollama)/`。
 
 ### 影响
-- 正常请求（下发 150000 / 256000）完全不受影响，仍然原样透传。
-- 只有「长对话 + `max_tokens` 小得不合理」的请求会被抬到 126000，用户不再看到 8192 这种
+- 正常请求（DSH 下发 128000）完全不受影响，仍然原样透传。
+- 只有「长对话 + `max_tokens` 小得不合理」的请求会被抬到 128000，用户不再看到 8192 这种
   莫名其妙的截断。
 - 若某天真遇到接近 1M 的上下文，护栏会把它顶成上游 400 而不是静默吐 1 个 token ——
   DSH 能识别 400 并触发压缩，比静默截断好排查。`ROUTER_GUARD_MAX_TOKENS=0` 仍可整体关闭。
-
 ## 2026-11-22 — 稳定性三修（客户端断开 / 失败入账 / 日志轮转）
 
 ### 1. 客户端断开不再「空转上游」
@@ -106,15 +111,15 @@ DSH 走 time-router（pi-ai / openai-completions 适配器）时，长会话会�
 
 ### 改动
 - `router.mjs` 新增 `applyMaxTokensGuard()`：转发前检查，**消息数 ≥ `ROUTER_GUARD_MIN_MSGS`（默认 20）
-  且 `max_tokens` < `ROUTER_GUARD_MAX_TOKENS`（默认 **126000**，见下方 2026-11-24 条目）** 时，
-  把预算抬回 126000 并打警告日志。
+  且 `max_tokens` < `ROUTER_GUARD_MAX_TOKENS`（默认 **128000**，见上方 2026-11-24 条目）** 时，
+  把预算抬回 128000 并打警告日志。
   - 只碰长对话：DSH 探活 / 标题 / 摘要那些 1~2 条消息 + 16/32/4096 的请求原样放过。
   - 正常预算（128000 / 256000）一律不动。
   - 抬上去后若真实输入确实塞不下，上游回 400 上下文超长，走已有的 overflow 原样透传分支，
     客户端能据此压缩 —— 比「静默只吐 1 个 token」好排查。
   - `ROUTER_GUARD_MAX_TOKENS=0` 关闭护栏。
 - 统计新增 `maxTokensGuard: { hits, last }`，`/_router/stats` 可查；`/_router/recent` 每条
-  增加 `maxTokens` / `maxTokensOriginal`。日志行形如 `max_tokens=126000（原 1 已抬升）  msgs=101`。
+  增加 `maxTokens` / `maxTokensOriginal`。日志行形如 `max_tokens=128000（原 1 已抬升）  msgs=101`。
 - `test-local.mjs` 假上游回显 `served_max_tokens`；新增 4 条断言（长对话抬升 / 短对话不动 /
   正常预算不动 / 计数可观测），并把「用量与成本统计」改成按两家合计断言
   （原来写死 `byProvider.deepseek`，在 auto-ollama 模式下会无故变红）。测试数 **11 → 15**。

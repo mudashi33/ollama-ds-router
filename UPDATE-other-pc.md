@@ -54,7 +54,7 @@
    先备份（<日期> 换成今天，例如 20261122）：
    copy "%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml" "%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml.bak-<日期>"
    在 providers.time-router.models[0] 这一块里两处：
-   a) maxTokens: 256000  →  改成 150000
+   a) maxTokens: 256000  →  改成 128000
       （按窗口开满会导致「上下文双超限」400；本机实测现在下发 128000）
    b) reasoningEfforts 必须四档齐全，缺 low 会让 /effort 菜单少一项：
       off: null
@@ -71,7 +71,7 @@
 
 6) 可选：补 .env 里的新变量（不补也能跑，都有默认值）
    把 .env 里已有的键名和 .env.example 对比，缺的只有下面三个，按需追加：
-   ROUTER_GUARD_MAX_TOKENS=126000    # max_tokens 被 DSH 钳成 1 时抬到多少；=0 关闭
+   ROUTER_GUARD_MAX_TOKENS=128000    # max_tokens 被 DSH 钳成 1 时抬到多少；=0 关闭
    ROUTER_GUARD_MIN_MSGS=20          # 少于这么多条消息不启用护栏
    ROUTER_LOG_MAX_AGE_DAYS=7         # 守护日志超过几天就轮转
    注意：改完 .env 要重做第 3 步的重启才生效。不要打印任何 key 的值。
@@ -91,7 +91,7 @@
 
 | 变化 | 对使用的影响 |
 |---|---|
-| max_tokens 护栏 | DSH 长会话把 `max_tokens` 钳成 1 时，路由器自动抬到 126000（126k），不再出现「已达到输出 token 上限」 |
+| max_tokens 护栏 | DSH 长会话把 `max_tokens` 钳成 1 时，路由器自动抬到 128000（128k），不再出现「已达到输出 token 上限」 |
 | 客户端断开即中止上游 | 按 Esc 取消后上游立刻停，不再继续生成计费；这类请求记成「客户端断开」，不算失败 |
 | 失败进账本 | 看板/账本里的失败数不再永远是 0；口径固定为 `requests = ok + failed + clientAborted` |
 | 日志轮转 | 守护日志超过 5MB 或 7 天自动轮转（copytruncate，不再出现写满磁盘的老问题） |
@@ -99,7 +99,7 @@
 
 ## 更新前自己确认一件事
 
-- 那台机器上的 `cordis.patch.yml` 里 `maxTokens` 如果还是 `256000`，第 4 步会把它改成 `150000`——
+- 那台机器上的 `cordis.patch.yml` 里 `maxTokens` 如果还是 `256000`，第 4 步会把它改成 `128000`——
   这是为了避免「上下文双超限」的 400 错误，不是可选项。
 - `.env` 不用动：新变量都有默认值，第 6 步是可选优化。
 - 重启路由器时在途请求会断一次（约 1.5 秒），不用紧张。

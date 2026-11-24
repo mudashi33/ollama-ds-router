@@ -439,12 +439,12 @@ async function chat(force, body = {}) {
 
 // 6.7 max_tokens 护栏：DSH 长会话里 pi-ai 会把 max_tokens 钳成 1（估算退化 → available 为负 →
 //     Math.max(1, …)），上游只吐 1 个 token 回 finish_reason=length，客户端就显示「已达到输出
-//     token 上限」。护栏要把「长对话 + 小得不合理」的预算抬回 126000（126k），同时不碰探活/短对话。
+//     token 上限」。护栏要把「长对话 + 小得不合理」的预算抬回 128000（128k），同时不碰探活/短对话。
 {
   const long = Array.from({ length: 30 }, (_, i) => ({ role: 'user', content: `m${i}` }));
   const r1 = await chat('deepseek', { max_tokens: 1, messages: long });
   const j1 = await r1.json();
-  check('长对话 max_tokens=1 被抬到 126000', j1.served_max_tokens === 126000, `上游收到 ${j1.served_max_tokens}`);
+  check('长对话 max_tokens=1 被抬到 128000', j1.served_max_tokens === 128000, `上游收到 ${j1.served_max_tokens}`);
 
   const r2 = await chat('deepseek', { max_tokens: 32 });
   const j2 = await r2.json();
@@ -454,15 +454,15 @@ async function chat(force, body = {}) {
   const j3 = await r3.json();
   check('长对话正常预算不被改动', j3.served_max_tokens === 256000, `上游收到 ${j3.served_max_tokens}`);
 
-  const r4 = await chat('deepseek', { max_tokens: 126000, messages: long });
+  const r4 = await chat('deepseek', { max_tokens: 128000, messages: long });
   const j4 = await r4.json();
-  check('刚好等于护栏值时不再抬（126000 原样）', j4.served_max_tokens === 126000, `上游收到 ${j4.served_max_tokens}`);
+  check('刚好等于护栏值时不再抬（128000 原样）', j4.served_max_tokens === 128000, `上游收到 ${j4.served_max_tokens}`);
 
   const s = await (await fetch('http://127.0.0.1:8799/_router/stats')).json();
   const g = s.maxTokensGuard || {};
   check(
     '护栏计数可观测',
-    g.hits >= 1 && g.last?.from === 1 && g.last?.to === 126000,
+    g.hits >= 1 && g.last?.from === 1 && g.last?.to === 128000,
     `hits=${g.hits} last=${JSON.stringify(g.last)}`,
   );
 }

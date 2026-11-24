@@ -21,7 +21,7 @@
 3. API key 由我自己填进 .env：你不要向我要 key，也不要把 key 打印到聊天、日志或命令回显里；
    不要 cat/type/Get-Content 整个 .env。
 4. 不要 npm install、不要 pnpm install —— 这个项目零运行时依赖，只用 Node 内置模块。
-5. DSH 侧只按下面第 5 步给的参数写：contextWindow 保持 1048576，maxTokens 填 150000
+5. DSH 侧只按下面第 5 步给的参数写：contextWindow 保持 1048576，maxTokens 填 128000
    （别按窗口开满——那是「上下文双超限」400 的来源，本机实测下发 128000）。
 6. 仓库是公开的，clone 不需要登录；如果报 403 或超时，那是网络问题（见文末代理说明），别当成权限问题。
 7. 装完只报告事实：每条验收的实际输出，不要写"应该没问题"。
@@ -77,7 +77,7 @@
               - id: auto
                 name: DeepSeek V4.1 Flash (自动选更便宜的一家)
                 contextWindow: 1048576
-                maxTokens: 150000
+                maxTokens: 128000
                 input:
                   - text
                   - image

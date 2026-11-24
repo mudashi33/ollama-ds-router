@@ -12,7 +12,7 @@ const HERE = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const REPORT = path.join(HERE, 'autostart', 'guard-verify.txt')
 const PORT = Number(process.env.ROUTER_PORT || 8788)
 // 护栏目标值：跟 router.mjs 的 ROUTER_GUARD_MAX_TOKENS 默认保持一致
-const GUARD_TO = Number(process.env.ROUTER_GUARD_MAX_TOKENS || 126000)
+const GUARD_TO = Number(process.env.ROUTER_GUARD_MAX_TOKENS || 128000)
 const arg = (name, def) => {
   const i = process.argv.indexOf('--' + name)
   return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : def

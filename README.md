@@ -172,7 +172,7 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `schedule.mjs` | 纯时间规则，无网络依赖；`node schedule.mjs --test` 跑边界用例 |
 | `router.mjs` | 本地 OpenAI 兼容代理，按规则转发 + 失败回退 + 用量记账 |
 | `probe.mjs` | 两家 API 的兼容性冒烟测试（tools / 流式 / 缓存） |
-| `test-local.mjs` | 用假上游回归测试路由逻辑（22 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径），不联网不花钱 |
+| `test-local.mjs` | 用假上游回归测试路由逻辑（23 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径/看板渲染），不联网不花钱 |
 | `holidays.json` | 中国法定节假日表（这些天 DeepSeek 全天空闲，路由全天走官方）；已含 2027 全年，改后自动重载 |
 | `stats.json` | 按北京日期累计的用量账本，自动生成；删掉即清零 |
 | `setup.mjs` / `setup.cmd` | 一键部署：找回 key、验证、写 `.env`、装自启、启动、查 DSH 配置 |
@@ -259,7 +259,7 @@ node probe.mjs
 
 ```powershell
 node schedule.mjs --test        # 时间规则边界（13 项）
-node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 记账（22 项）
+node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 记账（23 项）
 node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 ```
 
@@ -412,7 +412,9 @@ DSH 里按 Esc 取消、关窗口、或者网络断了，代理会跟着把上�
 以前 `addToDay()` 只在成功分支被调用，于是 `stats.json` 里 `failed` **永远是 0**，
 看板上根本看不出故障率（同一时段日志里其实有 42 条 `✗`）。现在失败走 `recordFailure()`，
 同样按天、按上游分桶记账；看板的「按上游」表格在次数后面挂红字「失败 N」，
-合计行还会单独标「失败 N · 客户端断开 N」。
+合计行把真故障标成红字「失败 N」，而「客户端断开」只是灰色小字「断开 N」——
+客户端断开是 DSH 自己按 Esc / 换步 / 重试造成的（上游随即被中止），不是路由器故障，
+累计上千条挂在首页红字里纯属吓人（2026-11-24 起降级显示）。
 
 带 `x-router-force` 的手动探针仍然只算 `probeCny`，不污染账本。
 

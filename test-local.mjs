@@ -87,7 +87,22 @@ function makeMock(name, port) {
 
     const chunks = [];
     for await (const c of req) chunks.push(c);
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    // 看板渲染时会去拉两家余额（GET，没有 body），假上游不认这些路径就直接回 404，
+    // 别让 JSON.parse('') 把整个测试进程炸掉。
+    // 两家 base 不同（deepseek 是 http://127.0.0.1:9101，ollama 带 /v1），所以按后缀认
+    if (req.method !== 'POST' || !url.pathname.endsWith('/chat/completions')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `${name} 假上游没有 ${url.pathname}` } }));
+      return;
+    }
+    let body;
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end('{"error":{"message":"假上游收到空 body"}}');
+      return;
+    }
     calls += 1;
 
     if (failsLeft > 0) {
@@ -540,6 +555,17 @@ async function chat(force, body = {}) {
     after.requests === after.ok + after.failed + after.clientAborted,
     `requests=${after.requests} ok=${after.ok} failed=${after.failed} clientAborted=${after.clientAborted}`,
   );
+}
+
+// 6.95 看板合计行：客户端断开不能顶红字（累计上千条，挂红字太扎眼），真失败才红
+{
+  const html = await (await fetch('http://127.0.0.1:8799/_router')).text();
+  const totalRow = (html.match(/<tr><td>合计<\/td>[\s\S]*?<\/tr>/) || [''])[0];
+  const ok =
+    totalRow.includes('断开 ') &&
+    !/客户端断开 \d/.test(totalRow) &&
+    !/<span class="warn">[^<]*断开/.test(totalRow);
+  check('看板合计行把客户端断开降成灰字', ok, totalRow.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120));
 }
 
 // 7. 两家都挂时返回 503

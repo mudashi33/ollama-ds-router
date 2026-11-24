@@ -943,10 +943,14 @@ async function dashboardHtml() {
     .join('');
   const upTotal = `<tr><td>合计</td>${periods
     .map(([, t]) => {
-      const bad = t.failed > 0 || t.clientAborted > 0
-        ? `<br><span class="warn">失败 ${t.failed || 0}${t.clientAborted ? ` · 客户端断开 ${t.clientAborted}` : ''}</span>`
+      // 「失败」是真故障（上游挂、超窗），红字留着；「客户端断开」是 DSH 自己按 Esc / 换步 /
+      // 重试造成的正常现象（每次都是一条被主动放弃的流），累计上千条挂红字顶在首页太扎眼。
+      // 这里降成灰色小字跟在花费后面，逐条明细仍可在下面的「最近请求」里看到橙色 ⊘。
+      const bad = t.failed > 0 ? `<br><span class="warn">失败 ${t.failed}</span>` : '';
+      const aborted = t.clientAborted > 0
+        ? `<span class="dim" title="客户端（DSH）主动取消的请求，上游已随之中止，不是路由器故障"> · 断开 ${t.clientAborted}</span>`
         : '';
-      return `<td>${t.requests} 次<br><span class="dim">${tok(t.tokens.input + t.tokens.output)} token</span><br>${money(t.costCny)}${bad}</td>`;
+      return `<td>${t.requests} 次<br><span class="dim">${tok(t.tokens.input + t.tokens.output)} token</span><br>${money(t.costCny)}${aborted}${bad}</td>`;
     })
     .join('')}</tr>`;
   // 每家花了多少：只列真正有请求的那几家

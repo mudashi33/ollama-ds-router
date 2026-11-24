@@ -194,16 +194,21 @@ function effortTag({ thinking, effort }) {
 // 护栏做的事：把「长对话 + 小得不合理」的 max_tokens 抬回一个能用的下限。
 //   - 只动 messages >= ROUTER_GUARD_MIN_MSGS（默认 20）的请求：
 //     DSH 探活 / 标题 / 摘要这类请求是 1~2 条消息 + 16/32/4096，不能碰。
-//   - 只抬 max_tokens < ROUTER_GUARD_MAX_TOKENS（默认 8192）的：
-//     正常请求是 128000 / 256000，原样不动。
-//     默认取 8192 而不是更大：DSH 实测输入 ~115k token，8192 能让
-//     「输入 + 输出」仍落在 128k 这一档窗口内，不至于主动把请求顶成上下文超长；
-//     而正常回答实测最长约 3.8k token，8192 有两倍余量。
+//   - 只抬 max_tokens < ROUTER_GUARD_MAX_TOKENS（默认 126000）的：
+//     正常请求是 150000 / 256000，原样不动。
+//     默认 126000（= 126k）：被钳坏的请求应当恢复成「本该有的输出预算」，
+//     而不是只给一个勉强够写一段的 8192。8192 是 2026-11-22 的初版值，实测
+//     124 次抬升里有 4 次正好写满 8192 —— 又撞一次上限，用户看到的现象就是
+//     「我明明设了 150k，怎么最大输出变成 8192」。
+//     126k 的安全性由真实数据兜底：日志里 14980 次成功请求的真实输入
+//     p50=122k / p95=182k / p99=199k / max=229k，229k + 126k = 355k，
+//     离 1M 窗口还很远；历史上 29 次超窗 400 报出的真实 prompt 全在
+//     111 万~147 万，没有一条落在「126k 会 400 而 8192 不会」的中间带。
 //   - 抬上去以后若真实输入真的塞不下，上游会回 400 上下文超长 ——
 //     下面的 overflow 分支会原样透传，DSH 据此触发压缩。
 //     比「静默吐 1 个 token」好排查得多。
 //   - ROUTER_GUARD_MAX_TOKENS=0 可整体关掉。
-const GUARD_MAX_TOKENS = Number(process.env.ROUTER_GUARD_MAX_TOKENS ?? 8192);
+const GUARD_MAX_TOKENS = Number(process.env.ROUTER_GUARD_MAX_TOKENS ?? 126000);
 const GUARD_MIN_MSGS = Number(process.env.ROUTER_GUARD_MIN_MSGS ?? 20);
 
 function applyMaxTokensGuard(body) {

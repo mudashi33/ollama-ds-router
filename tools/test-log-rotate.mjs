@@ -82,7 +82,9 @@ try {
   check('轮转后仍能继续写', buf.length > before, `${before}B → ${buf.length}B`);
   // copytruncate 的经典坑：如果句柄还记着旧偏移，新写入会从旧位置开始，中间留一片 NUL
   check('没有留下空洞（NUL 字节）', zeros === 0, `NUL=${zeros}`);
-  check('日志里能看到 router 的输出', buf.toString('utf8').includes('→ deepseek'), '');
+  // 注意：具体走哪一家取决于跑测试时的北京时间（DeepSeek 高峰会自动转 Ollama），
+  // 所以这里只验「router 的转发日志确实写进了这个文件」，不断言 provider。
+  check('日志里能看到 router 的输出', /→ (deepseek|ollama)/.test(buf.toString('utf8')), '');
 } finally {
   sup.kill();
   await sleep(600);

@@ -172,7 +172,7 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `schedule.mjs` | 纯时间规则，无网络依赖；`node schedule.mjs --test` 跑边界用例 |
 | `router.mjs` | 本地 OpenAI 兼容代理，按规则转发 + 失败回退 + 用量记账 |
 | `probe.mjs` | 两家 API 的兼容性冒烟测试（tools / 流式 / 缓存） |
-| `test-local.mjs` | 用假上游回归测试路由逻辑（21 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径），不联网不花钱 |
+| `test-local.mjs` | 用假上游回归测试路由逻辑（22 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径），不联网不花钱 |
 | `holidays.json` | 中国法定节假日表（这些天 DeepSeek 全天空闲，路由全天走官方）；已含 2027 全年，改后自动重载 |
 | `stats.json` | 按北京日期累计的用量账本，自动生成；删掉即清零 |
 | `setup.mjs` / `setup.cmd` | 一键部署：找回 key、验证、写 `.env`、装自启、启动、查 DSH 配置 |
@@ -259,7 +259,7 @@ node probe.mjs
 
 ```powershell
 node schedule.mjs --test        # 时间规则边界（13 项）
-node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 记账（21 项）
+node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 记账（22 项）
 node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 ```
 
@@ -372,10 +372,18 @@ node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 
 | 环境变量 | 默认 | 作用 |
 |---|---|---|
-| `ROUTER_GUARD_MAX_TOKENS` | `8192` | 低于此值的 `max_tokens` 会被抬到这里；`0` 关闭护栏 |
+| `ROUTER_GUARD_MAX_TOKENS` | `126000` | 低于此值的 `max_tokens` 会被抬到这里（126k）；`0` 关闭护栏 |
 | `ROUTER_GUARD_MIN_MSGS` | `20` | 只对消息数达到此值的请求生效（保护探活 / 短对话） |
 
-命中时 `router.log` 写 `max_tokens=8192（原 1 已抬升）`，`/_router/stats` 的
+护栏值为什么是 126k 而不是刚好够用的 8192：被钳坏的请求本该拿到你配置的输出预算
+（`maxTokens: 150000`），抬到 8192 只是「够写一段」，模型真写满 8192 还是会撞
+`finish_reason=length`，客户端照样显示「已达到输出 token 上限」。实测 124 次抬升里
+有 4 次（3%）正好写满 8192。而真实输入并不需要省这点空间：全量日志里成功请求的真实
+输入 p50=122k / p95=182k / p99=199k / max=229k，229k + 126k = 355k，离 1M 窗口还很远；
+历史上 29 次「上下文超窗」400 报出的 prompt 全在 111 万以上，没有一条落在
+「126k 会 400 而 8192 不会」的中间带。
+
+命中时 `router.log` 写 `max_tokens=126000（原 1 已抬升）`，`/_router/stats` 的
 `maxTokensGuard.hits` 会计数，`/_router/recent` 每条也带 `maxTokens` / `maxTokensOriginal`。
 抬升后若真实输入确实超长，上游回 400 上下文超长并原样透传给客户端，DSH 据此压缩。
 

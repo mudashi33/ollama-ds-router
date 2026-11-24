@@ -32,7 +32,7 @@
 
 2) 自检（三条全绿才能继续）
    node schedule.mjs --test       → 期望 13/13 PASS
-   node test-local.mjs            → 期望 21/21 PASS（旧版是 11/11，现在是 21/21）
+   node test-local.mjs            → 期望 22/22 PASS（旧版是 21/21，多了一条护栏边界用例）
    node tools/test-log-rotate.mjs → 期望 6/6 PASS（这个文件是新增的）
    任何一条失败：把完整报错贴给我，不要继续，也不要自己改测试。
 
@@ -71,7 +71,7 @@
 
 6) 可选：补 .env 里的新变量（不补也能跑，都有默认值）
    把 .env 里已有的键名和 .env.example 对比，缺的只有下面三个，按需追加：
-   ROUTER_GUARD_MAX_TOKENS=8192      # max_tokens 被 DSH 钳成 1 时抬到多少；=0 关闭
+   ROUTER_GUARD_MAX_TOKENS=126000    # max_tokens 被 DSH 钳成 1 时抬到多少；=0 关闭
    ROUTER_GUARD_MIN_MSGS=20          # 少于这么多条消息不启用护栏
    ROUTER_LOG_MAX_AGE_DAYS=7         # 守护日志超过几天就轮转
    注意：改完 .env 要重做第 3 步的重启才生效。不要打印任何 key 的值。
@@ -91,11 +91,11 @@
 
 | 变化 | 对使用的影响 |
 |---|---|
-| max_tokens 护栏 | DSH 长会话把 `max_tokens` 钳成 1 时，路由器自动抬到 8192，不再出现「已达到输出 token 上限」 |
+| max_tokens 护栏 | DSH 长会话把 `max_tokens` 钳成 1 时，路由器自动抬到 126000（126k），不再出现「已达到输出 token 上限」 |
 | 客户端断开即中止上游 | 按 Esc 取消后上游立刻停，不再继续生成计费；这类请求记成「客户端断开」，不算失败 |
 | 失败进账本 | 看板/账本里的失败数不再永远是 0；口径固定为 `requests = ok + failed + clientAborted` |
 | 日志轮转 | 守护日志超过 5MB 或 7 天自动轮转（copytruncate，不再出现写满磁盘的老问题） |
-| 测试 11 项 → 21 项 | 自检更严；新增 `tools/test-log-rotate.mjs` |
+| 测试 21 项 → 22 项 | 新增「刚好等于护栏值时不抬」边界用例 |
 
 ## 更新前自己确认一件事
 

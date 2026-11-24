@@ -43,7 +43,7 @@
 
 2) 自检（项目自带测试，不需要任何依赖）
    node schedule.mjs --test     → 期望 13/13 PASS（高峰判定、节假日、边界时刻）
-   node test-local.mjs          → 期望 21/21 PASS（429 回退、参数方言回退、SSE 透传、gzip 头、成本计算、
+   node test-local.mjs          → 期望 22/22 PASS（429 回退、参数方言回退、SSE 透传、gzip 头、成本计算、
                                    max_tokens 护栏、客户端断开传播、失败入账、双失败 503 等）
    node tools/test-log-rotate.mjs → 期望 6/6 PASS（守护进程日志的 copytruncate 轮转）
    任何一条失败：把完整报错贴给我，不要继续。

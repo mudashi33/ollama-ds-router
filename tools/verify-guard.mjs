@@ -11,6 +11,8 @@ import { fileURLToPath } from 'node:url'
 const HERE = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const REPORT = path.join(HERE, 'autostart', 'guard-verify.txt')
 const PORT = Number(process.env.ROUTER_PORT || 8788)
+// 护栏目标值：跟 router.mjs 的 ROUTER_GUARD_MAX_TOKENS 默认保持一致
+const GUARD_TO = Number(process.env.ROUTER_GUARD_MAX_TOKENS || 126000)
 const arg = (name, def) => {
   const i = process.argv.indexOf('--' + name)
   return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : def
@@ -88,7 +90,7 @@ try {
   const s = await (await fetch('http://127.0.0.1:' + PORT + '/_router/stats')).json()
   const g = s.maxTokensGuard || {}
   say('stats.maxTokensGuard hits=' + g.hits + ' last=' + JSON.stringify(g.last))
-  say(g.hits >= 1 && g.last?.from === 1 && g.last?.to === 8192 ? 'RESULT=PASS' : 'RESULT=FAIL')
+  say(g.hits >= 1 && g.last?.from === 1 && g.last?.to === GUARD_TO ? 'RESULT=PASS' : 'RESULT=FAIL')
 } catch (err) {
   say('stats failed: ' + err.message)
 }

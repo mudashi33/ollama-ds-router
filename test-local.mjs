@@ -809,6 +809,9 @@ async function chat(force, body = {}) {
     }
   }
   check('探针成功后自动恢复', !!back && back.recoveries >= 1, back ? 'recoveries=' + back.recoveries + ' lastProbe=' + JSON.stringify(back.lastProbe || null) : '10 秒内没有恢复');
+  // 探针本身也要计数：成功/失败都算「发出去过一次」
+  const statsAfterProbe = await (await fetch(BR + '/stats')).json();
+  check('探针次数可观测（不止成功才计）', statsAfterProbe.breaker.probeRequests >= 1, 'probeRequests=' + statsAfterProbe.breaker.probeRequests + ' probeCny=' + statsAfterProbe.breaker.probeCny);
 
   // 恢复后指定 ollama 又能真的走 ollama
   const r2 = await chat('ollama');

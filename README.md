@@ -173,7 +173,7 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `schedule.mjs` | 纯时间规则，无网络依赖；`node schedule.mjs --test` 跑边界用例 |
 | `router.mjs` | 本地 OpenAI 兼容代理，按规则转发 + 失败回退 + 用量记账 |
 | `probe.mjs` | 两家 API 的兼容性冒烟测试（tools / 流式 / 缓存） |
-| `test-local.mjs` | 用假上游回归测试路由逻辑（42 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径/看板渲染/错误正文限时/余额并行/上游熔断/SIGTERM 落盘），不联网不花钱 |
+| `test-local.mjs` | 用假上游回归测试路由逻辑（43 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径/看板渲染/错误正文限时/余额并行/上游熔断/SIGTERM 落盘），不联网不花钱 |
 | `holidays.json` | 中国法定节假日表（这些天 DeepSeek 全天空闲，路由全天走官方）；已含 2027 全年，改后自动重载 |
 | `stats.json` | 按北京日期累计的用量账本，自动生成；删掉即清零 |
 | `setup.mjs` / `setup.cmd` | 一键部署：找回 key、验证、写 `.env`、装自启、启动、查 DSH 配置 |
@@ -261,7 +261,7 @@ node probe.mjs
 
 ```powershell
 node schedule.mjs --test        # 时间规则边界（13 项）
-node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 熔断 / 记账（42 项）
+node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 熔断 / 记账（43 项）
 node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 ```
 
@@ -486,7 +486,9 @@ DeepSeek 又正处高峰，于是**每一条**请求都先去 Ollama 白等约 2
 - 日志三种标记：`⛔ … 暂停使用`、`⏻ … 探活仍失败（HTTP 429 …）`、`✓ … 已恢复使用（熔断持续 N 秒）`。
 
 回归用例在 `test-local.mjs` 的 6.97：「400 参数错误不计入熔断 / 连续 3 次 5xx 后熔断 /
-熔断期间跳过这家 / 探针成功后自动恢复 / 恢复后重新走这家 / 额度用尽一次即熔断 / 看板卡片」。
+熔断期间跳过这家 / 探针成功后自动恢复 / 探针次数可观测 / 恢复后重新走这家 / 额度用尽一次即熔断 / 看板卡片」。
+探针计数 `stats.breaker.probeRequests` 是「发出去几次」而不是「成功几次」——额度用尽期间每次探针
+都失败，若只数成功，看板会显示「探针 0 次」，看着像没在探活。
 
 ### 一次体检修掉的 9 个问题（2026-11-24）
 

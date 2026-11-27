@@ -783,6 +783,8 @@ async function probeUpstream(id) {
   const u = cfg.upstreams[id];
   const t0 = Date.now();
   const payload = JSON.stringify({ model: u.model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, stream: false });
+  // 先计数：探针不管通没通都发出去了一次（以前只在成功时 ++，看板上会出现「探过了却写 0 次」）
+  stats.breaker.probeRequests++;
   try {
     const r = await fetch(`${u.base}/chat/completions`, {
       method: 'POST',
@@ -798,7 +800,6 @@ async function probeUpstream(id) {
       if (usage) {
         const at = now();
         const tier = id === 'deepseek' ? (isDeepSeekPeak(at) ? 'peak' : 'off') : (isOllamaPeak(at) ? 'peak' : 'off');
-        stats.breaker.probeRequests++;
         stats.breaker.probeCny += costCny(id, tier, usage);
       }
     } catch {

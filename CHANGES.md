@@ -32,11 +32,12 @@ DeepSeek 正处高峰，于是**每条**请求都先去 Ollama 白等约 2.5 秒
 - 探针花费单独记 `stats.breaker.probeCny`，不冒充用户请求，也不进「省了多少」。
 
 ### 测试
-`test-local.mjs` 35 → **42 项**，新增 6.97 一整段（7 条断言）：400 连试 3 次不熔断 /
+`test-local.mjs` 35 → **43 项**，新增 6.97 一整段（8 条断言）：400 连试 3 次不熔断 /
 连 3 次 503 熔断 / 熔断期间请求不走那家（`ol.calls` 不增）/ 探针成功后自动恢复（`recoveries>=1`）/
-恢复后重新走那家 / 429+额度文案一次即熔断 / 看板有「上游健康」卡片。
+探针次数可观测（`probeRequests` 失败也计，否则看板显示「探针 0 次」像没在探活）/ 恢复后重新走那家 /
+429+额度文案一次即熔断 / 看板有「上游健康」卡片。
 测试用 `ROUTER_BREAKER_PROBE_MS=800` + `ROUTER_BREAKER_TICK_MS=200` 把「3 分钟后探活」压到秒级。
-`node test-local.mjs` → **42/42 通过**。
+`node test-local.mjs` → **43/43 通过**。
 
 ### 环境变量
 新增 4 个（`.env.example` 30 → 34 个，router 23 → 27 个）：`ROUTER_BREAKER_FAILS`、

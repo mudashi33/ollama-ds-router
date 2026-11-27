@@ -1,5 +1,44 @@
 # 变更记录
 
+## 2026-11-27（续）— 改了 .env 不用重启：key 热重载
+
+### 起因
+用户 17:21 把新 key 写进 `ollama-ds-router/.env`，几分钟过去一条请求都没切过去，问「你怎么没切换?」。
+两个原因叠加：
+
+1. `--env-file` 只在进程启动时读一次（`tools/supervisor.mjs` 就是这么起的），改文件对跑着的进程没有任何影响。
+2. 熔断器把 Ollama 停着：旧 key 的 429 已经把它暂停了，就算读到了新 key，也要等下一次探针（3 分钟）才会被选中。
+
+### 做法
+- `router.mjs` 在 `allBalances()` 之后新增一段 .env 热重载：
+  `ENV_FILE`（默认取 `--env-file` 的那个文件，可用 `ROUTER_ENV_FILE` 指定）、`ENV_CHECK_MS`（默认 15000）、
+  `parseEnvFile()`、`reloadEnvKeys()`、`watchEnvFile()`。
+- 启动时记下 mtime，`setInterval` 里 stat 一次；变了就重读 `*_API_KEY` / `*_BASE` / `*_MODEL`，
+  **清掉这家的余额缓存、解掉这家的熔断**（新 key 不该被旧 key 的失败继续拖着），日志写
+  `检测到 .env 变化，已重新加载 ollama（key 不打印；余额缓存与熔断已重置）`。
+- 只在「带 `--env-file` 启动」或「显式给了 `ROUTER_ENV_FILE`」时启用。这条限制是有意的：
+  测试是直接注入环境变量的，不设防的话它会把仓库里真实的 `.env` 读进来覆盖测试值。
+- 新增 `GET /_router/reload-env`（不想等轮询时手动触发，内容没变时 `changed:[]` 不乱重置）；
+  `/_router/mode` 多三行 `deepseekKey=已配置(尾号 abcd)` / `ollamaKey=…` / `envWatch=on(.env,15s)`；
+  启动横幅多一行说明。
+- 顺手修：`envWatch` 间隔小于 1 秒时别再显示成 `0s`（测试里 200ms 会撞上）。
+
+### 测试
+- `test-local.mjs` 43 → **50 项**，新增 6.98 段 6 条：启动读到的是 `ROUTER_ENV_FILE` 指定的文件 /
+  改 key 后几秒内自动生效 / 旧 key 拖着的熔断自动解掉 / 上游真的收到新 Bearer / 手动
+  `/_router/reload-env` 可用 / 内容没变时不误报变化。
+- 假上游新增记录 `lastAuth` 并暴露 `mock.auth`，用来验「发出去的 Authorization 真的换了」，
+  否则热重载只是显示层面好看。
+- `node test-local.mjs` 50/50、`node schedule.mjs --test` 13/13 + 节假日、`node tools/test-log-rotate.mjs` 6/6。
+
+### 文档
+- `README.md`：新小节「改了 .env 不用重启」（两个变量 + 可观测 + 回归用例）、原始 JSON 列表加
+  `/_router/reload-env`、测试数 43→50。
+- `.env.example`：新增 `ROUTER_ENV_FILE` / `ROUTER_ENV_CHECK_MS`（34→36 个）。
+- `UPDATE-other-pc.md` / `INSTALL-other-pc.md`：期望测试数改 50/50，变化表加「.env 热重载」一行。
+
+
+
 ## 2026-11-27 — 上游熔断：连续挂 3 次先别用它，每 3 分钟探活一次
 
 ### 起因

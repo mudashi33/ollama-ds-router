@@ -58,7 +58,7 @@
 不进 `requests`、不进 `byProvider`、也不进 `stats.json` 的历史——免得调试把账搅乱。
 
 原始 JSON：`/_router/status`（当前选择）、`/_router/stats`（用量与花费）、
-`/_router/balance`（余额）、`/_router/breaker`（上游熔断状态）。
+`/_router/balance`（余额）、`/_router/breaker`（上游熔断状态）、`/_router/reload-env`（重读 .env）。
 
 这些数字按**北京日期**记进同目录的 `stats.json`，重启不清零，所以看板上的
 「今日 / 近 7 天 / 累计」是跨重启累计的；想清零就删掉这个文件再重启代理。
@@ -173,7 +173,7 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `schedule.mjs` | 纯时间规则，无网络依赖；`node schedule.mjs --test` 跑边界用例 |
 | `router.mjs` | 本地 OpenAI 兼容代理，按规则转发 + 失败回退 + 用量记账 |
 | `probe.mjs` | 两家 API 的兼容性冒烟测试（tools / 流式 / 缓存） |
-| `test-local.mjs` | 用假上游回归测试路由逻辑（43 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径/看板渲染/错误正文限时/余额并行/上游熔断/SIGTERM 落盘），不联网不花钱 |
+| `test-local.mjs` | 用假上游回归测试路由逻辑（50 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径/看板渲染/错误正文限时/余额并行/上游熔断/.env 热重载/SIGTERM 落盘），不联网不花钱 |
 | `holidays.json` | 中国法定节假日表（这些天 DeepSeek 全天空闲，路由全天走官方）；已含 2027 全年，改后自动重载 |
 | `stats.json` | 按北京日期累计的用量账本，自动生成；删掉即清零 |
 | `setup.mjs` / `setup.cmd` | 一键部署：找回 key、验证、写 `.env`、装自启、启动、查 DSH 配置 |
@@ -261,7 +261,7 @@ node probe.mjs
 
 ```powershell
 node schedule.mjs --test        # 时间规则边界（13 项）
-node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 熔断 / 记账（43 项）
+node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 熔断 / .env 热载 / 记账（50 项）
 node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 ```
 
@@ -489,6 +489,34 @@ DeepSeek 又正处高峰，于是**每一条**请求都先去 Ollama 白等约 2
 熔断期间跳过这家 / 探针成功后自动恢复 / 探针次数可观测 / 恢复后重新走这家 / 额度用尽一次即熔断 / 看板卡片」。
 探针计数 `stats.breaker.probeRequests` 是「发出去几次」而不是「成功几次」——额度用尽期间每次探针
 都失败，若只数成功，看板会显示「探针 0 次」，看着像没在探活。
+
+### 改了 .env 不用重启（2026-11-27）
+
+`--env-file` 只在进程启动时读一次。2026-11-27 用户把新 key 写进 `.env`，几分钟过去
+一条请求都没切过去——跑着的进程根本不知道文件变了（那天还叠加了熔断：旧 key 的 429
+已经把 Ollama 暂停，即使读到了新 key 也要等探针）。
+
+现在启动后盯着 `.env` 的 mtime（默认 15 秒看一次），一变就重新读 key / base / model，
+并且**清掉余额缓存、解掉这家的熔断**——新 key 不该被旧 key 的失败继续拖着。
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `ROUTER_ENV_FILE` | 带 `--env-file` 启动时自动等于 `<仓库>/.env` | 要盯的 env 文件；显式指定时即使是别的路径也会盯 |
+| `ROUTER_ENV_CHECK_MS` | `15000` | 多久看一次 mtime |
+
+只在「带 `--env-file` 启动」或「显式给了 `ROUTER_ENV_FILE`」时才启用。这条限制是有意的：
+测试和子进程是直接注入环境变量的，若不设防，它会把仓库里真实的 `.env` 读进来覆盖测试值。
+
+- 日志：`检测到 .env 变化，已重新加载 ollama（key 不打印；余额缓存与熔断已重置）`
+- 手动触发（不想等那 15 秒）：`GET /_router/reload-env` → `{ok:true, file:'.env', changed:['ollama']}`；
+  内容没变时 `changed:[]`，不会无脑重置缓存。未启用时返回 409 和原因。
+- 想核对「现在用的到底是哪把 key」：`/_router/mode` 里的 `deepseekKey=已配置(尾号 abcd)` /
+  `ollamaKey=…` 只露后四位，`envWatch=on(.env,15s)` 说明热载挂在哪个文件上。
+- 启动横幅也会写一行 `.env 热载 .env（每 15s 看一次 mtime，换了 key 不用重启）`。
+
+回归用例在 `test-local.mjs` 的 6.98（6 条）：启动读到的是 `ROUTER_ENV_FILE` 指定的文件 /
+改 key 后几秒内自动生效 / 旧 key 拖着的熔断自动解掉 / 上游真的收到新 Bearer /
+手动 `/_router/reload-env` 可用 / 内容没变时不误报变化。
 
 ### 一次体检修掉的 9 个问题（2026-11-24）
 

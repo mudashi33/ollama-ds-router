@@ -32,8 +32,8 @@
 
 2) 自检（三条全绿才能继续）
    node schedule.mjs --test       → 期望 13/13 PASS
-   node test-local.mjs            → 期望 43/43 PASS（旧版 23/23 → 35/35 → 43/43：多了上游熔断 8 条，
-                                    以及错误正文限时、看板转义、余额并行、userRequests 口径、SIGTERM 落盘、
+   node test-local.mjs            → 期望 50/50 PASS（旧版 23/23 → 35/35 → 43/43 → 50/50：多了上游熔断 8 条、
+                                    .env 热重载 6 条，以及错误正文限时、看板转义、余额并行、userRequests 口径、SIGTERM 落盘、
                                     drain 监听器、老版 completions 等用例）
    node tools/test-log-rotate.mjs → 期望 6/6 PASS（这个文件是新增的）
    任何一条失败：把完整报错贴给我，不要继续，也不要自己改测试。
@@ -107,7 +107,8 @@
 | 失败进账本 | 看板/账本里的失败数不再永远是 0；口径固定为 `requests = ok + failed + clientAborted` |
 | 日志轮转 | 守护日志超过 5MB 或 7 天自动轮转（copytruncate，不再出现写满磁盘的老问题） |
 | 上游熔断 | 某家连续失败 3 次（或一次「额度用尽」）就暂停它、直接走另一家，不再每条白等 2~3 秒；每 3 分钟发一条 1-token 探针，通了自动切回。看板多一张「上游健康」卡片，`GET /_router/breaker` 看状态、`/_router/breaker/reset` 手动清空 |
-| 测试 23 项 → 43 项 | 新增上游熔断（8 条）、错误正文限时、看板转义、余额并行、userRequests 口径、SIGTERM 落盘、drain 监听器、老版 completions 等用例 |
+| 测试 23 项 → 50 项 | 新增上游熔断（8 条）、.env 热重载（6 条）、错误正文限时、看板转义、余额并行、userRequests 口径、SIGTERM 落盘、drain 监听器、老版 completions 等用例 |
+| .env 热重载 | 换了 key 不用重启：启动后每 15 秒看一次 `.env` 的 mtime，一变就重读 key/base/model，并清掉余额缓存、解掉这家的熔断。`GET /_router/reload-env` 可手动触发；`/_router/mode` 里 `deepseekKey=已配置(尾号 abcd)` 能核对现在用的是哪把 |
 | 修掉 9 个问题 | 错误正文不再挂死请求、护栏认 `max_completion_tokens` 与字符串、看板不再执行上游脚本、余额并行拉（最坏 16s → 3s）、看板次数改显示「用户问了几次」、退出不再丢最后一笔账 |
 | 账本字段 | 新增 `userRequests`（用户真正问了几次，不含兜底重试）；旧账本首次启动自动回填并升到 version 2 |
 | 看板合计行 | 「客户端断开 N」由红字改成灰色小字「断开 N」，真故障「失败 N」仍是红字 |

@@ -1221,6 +1221,100 @@ async function allBalances() {
   const [deepseek, ollama] = await Promise.all([upstreamBalance('deepseek'), upstreamBalance('ollama')]);
   return { deepseek, ollama };
 }
+// ------------------------------------------------------------------ .env 热重载
+// --env-file 只在进程启动时读一次，于是「换了 key、路由器还在用旧的那把」成了最容易踩的坑：
+// 2026-11-27 用户把新 key 写进 .env，几分钟过去一条请求都没切过去，因为跑着的进程不知道文件变了
+// （那天还叠加了熔断：旧 key 的 429 已经把 Ollama 暂停了，换 key 也照样不被选中）。
+// 现在启动后盯着 .env 的 mtime：一变就重读 key / base / model，清掉余额缓存，并解除这家的熔断——
+// 新 key 不该被旧 key 的失败继续拖着。只在带 --env-file 启动、或显式给了 ROUTER_ENV_FILE 时才启用：
+// 测试是直接注入环境变量的，绝不能反过来把仓库里真实的 .env 读进来。
+const ENV_FILE = process.env.ROUTER_ENV_FILE
+  || (process.execArgv.some((a) => String(a).startsWith('--env-file')) ? path.join(HERE, '.env') : '');
+const ENV_CHECK_MS = Number(process.env.ROUTER_ENV_CHECK_MS || 15000);
+const ENV_FIELDS = {
+  deepseek: { key: 'DEEPSEEK_API_KEY', base: 'DEEPSEEK_BASE', model: 'DEEPSEEK_MODEL' },
+  ollama: { key: 'OLLAMA_API_KEY', base: 'OLLAMA_BASE', model: 'OLLAMA_MODEL' },
+};
+let envMtime = 0;
+
+/** 只认 KEY=VALUE / KEY="VALUE" 这种最简单的写法，够 .env 用了 */
+function parseEnvFile(file) {
+  const out = {};
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return out;
+  }
+  for (const line of raw.split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s || s.startsWith('#')) continue;
+    const i = s.indexOf('=');
+    if (i <= 0) continue;
+    const k = s.slice(0, i).trim();
+    let v = s.slice(i + 1).trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    if (k) out[k] = v;
+  }
+  return out;
+}
+
+function reloadEnvKeys() {
+  if (!ENV_FILE) return { ok: false, reason: '未启用（启动时没有 --env-file，可用 ROUTER_ENV_FILE 指定）' };
+  const map = parseEnvFile(ENV_FILE);
+  const changed = [];
+  for (const [id, f] of Object.entries(ENV_FIELDS)) {
+    const u = cfg.upstreams[id];
+    const before = { key: u.key, base: u.base, model: u.model };
+    const nextKey = map[f.key];
+    const nextBase = map[f.base];
+    const nextModel = map[f.model];
+    if (nextKey && nextKey !== u.key) u.key = nextKey;
+    if (nextBase) u.base = String(nextBase).replace(/\/+$/, '');
+    if (nextModel && nextModel !== u.model) u.model = nextModel;
+    if (u.key === before.key && u.base === before.base && u.model === before.model) continue;
+    changed.push(id);
+    // 换了 key/地址：余额得重新查，熔断也得解掉，否则新 key 还要被旧 key 的 429 拖 3 分钟
+    balanceCache.delete(id);
+    Object.assign(breaker[id], { open: false, fails: 0, nextProbeAt: 0, probing: false, lastReason: '', openedAt: 0 });
+  }
+  if (changed.length) {
+    log('检测到 .env 变化，已重新加载 ' + changed.join(', ') + '（key 不打印；余额缓存与熔断已重置）');
+    stats.breaker.last = { at: new Date().toISOString(), provider: changed.join(','), action: 'env-reload' };
+  }
+  return { ok: true, file: path.basename(ENV_FILE), changed };
+}
+
+/** 只露尾巴：换 key 后能一眼看出「用的是不是新的」，又不会把 key 本身写进日志/看板 */
+function keyFingerprint(key) {
+  if (!key) return '未配置';
+  const s = String(key);
+  return s.length <= 8 ? '已配置' : '已配置(尾号 ' + s.slice(-4) + ')';
+}
+function watchEnvFile() {
+  if (!ENV_FILE) return;
+  try {
+    envMtime = fs.statSync(ENV_FILE).mtimeMs;
+  } catch {
+    envMtime = 0; // 文件还不存在也要继续盯，用户可能刚复制出来
+  }
+  const timer = setInterval(() => {
+    let m = 0;
+    try {
+      m = fs.statSync(ENV_FILE).mtimeMs;
+    } catch {
+      return;
+    }
+    if (!m || m === envMtime) return;
+    envMtime = m;
+    try {
+      reloadEnvKeys();
+    } catch (err) {
+      log('.env 热重载失败（继续用旧配置）：' + (err?.message || err));
+    }
+  }, ENV_CHECK_MS);
+  if (timer.unref) timer.unref();
+}
 
 // ------------------------------------------------------------------ 看板
 
@@ -1450,6 +1544,7 @@ async function dashboardHtml() {
 
 loadHolidays();
 loadHistory();
+watchEnvFile();
 
 // holidays.json 改了不用重启：监听文件变化后重载（编辑器用「重命名替换」时会丢监听，忽略即可）
 try {
@@ -1494,6 +1589,11 @@ async function modeSnapshot() {
     `providerLabel=${cfg.upstreams[p.provider].label}`,
     `reason=${p.reason}`,
     `beijing=${clock(at)}`,
+    // 换 key 后想确认「到底吃进去没有」：只露尾号，够核对、不足以泄露
+    `deepseekKey=${keyFingerprint(cfg.upstreams.deepseek.key)}`,
+    `ollamaKey=${keyFingerprint(cfg.upstreams.ollama.key)}`,
+    // 轮询间隔小于 1 秒时按毫秒写，别显示成「0s」
+    `envWatch=${ENV_FILE ? 'on(' + path.basename(ENV_FILE) + ',' + (ENV_CHECK_MS >= 1000 ? Math.round(ENV_CHECK_MS / 1000) + 's' : ENV_CHECK_MS + 'ms') + ')' : 'off'}`,
     `deepseekPeak=${isDeepSeekPeak(at) ? 1 : 0}`,
     `deepseekPeakWindow=工作日 09:00–12:00、14:00–18:00`,
     `ollamaPeak=${isOllamaPeak(at) ? 1 : 0}`,
@@ -1561,6 +1661,12 @@ async function handle(req, res) {
     log(`模式切换 → ${MODES[next].label}${saved ? '' : '（写文件失败，仅内存生效）'}`);
     const p = choose();
     return sendJson(res, 200, { ok: true, mode, label: MODES[mode].label, provider: p.provider, reason: p.reason, saved });
+  }
+
+  // 手动重读 .env（不想等那 15 秒轮询时用；正常情况改了文件自己就生效）
+  if (url.pathname === '/_router/reload-env') {
+    const r = reloadEnvKeys();
+    return sendJson(res, r.ok ? 200 : 409, r);
   }
 
   // 熔断状态：托盘/脚本排障时想直接看「现在是哪家被暂停、还有多久探活」
@@ -1829,6 +1935,11 @@ server.listen(cfg.port, cfg.host, () => {
     BREAKER_FAILS > 0
       ? `  熔断      连续失败 ${BREAKER_FAILS} 次暂停一家；每 ${humanSec(BREAKER_PROBE_MS)}用 1-token 探针试活（ROUTER_BREAKER_* 可调，FAILS=0 关闭）`
       : '  熔断      已关闭（ROUTER_BREAKER_FAILS=0）',
+  );
+  console.log(
+    ENV_FILE
+      ? `  .env 热载 ${path.basename(ENV_FILE)}（每 ${ENV_CHECK_MS >= 1000 ? Math.round(ENV_CHECK_MS / 1000) + 's' : ENV_CHECK_MS + 'ms'} 看一次 mtime，换了 key 不用重启）`
+      : '  .env 热载 未启用（没带 --env-file 启动；可用 ROUTER_ENV_FILE 指定）',
   );
   for (const [id, u] of Object.entries(cfg.upstreams)) {
     console.log(`  ${u.label.padEnd(14)} ${u.base}  model=${u.model}  key=${u.key ? '已配置' : '未配置'}`);

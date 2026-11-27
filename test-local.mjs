@@ -43,6 +43,7 @@ function makeMock(name, port) {
   let failMsgNext = null;
   let slowPrematureClose = 0; // 上游视角：自己还没写完就被掐断的次数
   let slowFinished = 0;
+  let lastAuth = null; // .env 热重载：换 key 后上游收到的 Bearer 应该跟着变
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
@@ -147,6 +148,7 @@ function makeMock(name, port) {
       return;
     }
     calls += 1;
+    lastAuth = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
 
     if (failMsgNext !== null) {
       const msg = failMsgNext;
@@ -252,6 +254,9 @@ function makeMock(name, port) {
     get calls() {
       return calls;
     },
+    get auth() {
+      return lastAuth;
+    },
     fail(status, count = 1, msg = null) {
       const q = new URLSearchParams({ status: String(status), count: String(count) });
       if (msg) q.set('msg', msg);
@@ -296,6 +301,10 @@ const FIXED_MODE = JSON.stringify({ mode: 'auto-ds', at: new Date().toISOString(
 fs.writeFileSync(path.join(TMP, 'mode.json'), FIXED_MODE);
 fs.writeFileSync(path.join(TMP, 'mode2.json'), FIXED_MODE);
 
+// .env 热重载用的临时 env 文件：测试绝不能碰仓库里真实的 .env
+const ENVFILE = path.join(TMP, '.env.test');
+fs.writeFileSync(ENVFILE, 'DEEPSEEK_API_KEY=test-ds\nOLLAMA_API_KEY=test-ol-old\n');
+
 const router = spawn(process.execPath, ['router.mjs'], {
   cwd: here,
   env: sandboxEnv({
@@ -308,6 +317,9 @@ const router = spawn(process.execPath, ['router.mjs'], {
     // 熔断：探针 800ms 一次、扫描 200ms 一次，「恢复」那条用例才能在几秒内跑完
     ROUTER_BREAKER_PROBE_MS: '800',
     ROUTER_BREAKER_TICK_MS: '200',
+    // .env 热重载：盯临时文件、200ms 一次，「改文件 → 生效」那条用例才跑得快
+    ROUTER_ENV_FILE: ENVFILE,
+    ROUTER_ENV_CHECK_MS: '200',
     DEEPSEEK_BASE: 'http://127.0.0.1:9101',
     DEEPSEEK_API_KEY: 'test-ds',
     DEEPSEEK_MODEL: 'deepseek-flash',
@@ -900,6 +912,75 @@ async function chat(force, body = {}) {
 {
   check('没有 MaxListenersExceededWarning（drain 监听器不泄漏）', !routerLog.includes('MaxListenersExceededWarning'), 'routerLog 长度 ' + routerLog.length);
 }
+// 6.98 改了 .env 不用重启：盯着文件 mtime，key 一变就重读（并解掉旧 key 拖着的熔断）
+{
+  const BR = 'http://127.0.0.1:8799/_router';
+  const snap = async () => (await fetch(BR + '/mode')).text();
+  const waitFor = async (fn, ms = 6000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      const v = await fn();
+      if (v) return v;
+      await sleep(150);
+    }
+    return null;
+  };
+
+  // 先确认启动时读的是临时 env 文件里的值，而不是仓库里真实的 .env
+  const before = await snap();
+  check(
+    '.env 热重载：启动时读的是 ROUTER_ENV_FILE 指定的文件',
+    // 启动时 key 来自环境变量（.env 只在「变化后」才被应用），这里只验热载确实挂在临时文件上
+    before.includes('envWatch=on(.env.test,') && before.includes('ollamaKey=已配置'),
+    before.split('\n').filter((l) => l.startsWith('envWatch') || l.includes('Key=')).join(' | '),
+  );
+
+  // 旧 key 先在熔断里：换 key 不该被旧 key 的失败继续拖着
+  await ol.fail(429, 1, 'you (1) have reached your monthly usage limit, add usage credits');
+  await chat('ollama');
+  const opened = await (await fetch(BR + '/breaker')).json();
+  check('换 key 前先把 ollama 熔断（旧 key 已废）', opened.upstreams.ollama.open === true, 'open=' + opened.upstreams.ollama.open);
+
+  // 改写 env 文件：ollama 的 key 与 model 都换掉
+  fs.writeFileSync(ENVFILE, 'DEEPSEEK_API_KEY=test-ds\nOLLAMA_API_KEY=test-ol-brand-new-key\nOLLAMA_MODEL=deepseek-v4.2-next\n');
+  const picked = await waitFor(async () => {
+    const t = await snap();
+    return t.includes('ollamaKey=已配置(尾号 -key)') ? t : null;
+  });
+  check('.env 改了 key：几秒内自动生效（不用重启）', !!picked, picked ? picked.split('\n').find((l) => l.includes('ollamaKey=')) : '6 秒内 modeSnapshot 里的 key 尾号没变');
+
+  const after = picked ? await (await fetch(BR + '/breaker')).json() : null;
+  check(
+    '.env 改了 key：旧 key 拖着的熔断自动解掉',
+    after?.upstreams.ollama.open === false && after?.upstreams.ollama.fails === 0,
+    after ? 'open=' + after.upstreams.ollama.open + ' fails=' + after.upstreams.ollama.fails : '没读到 breaker',
+  );
+
+  // 真正发出去的 Authorization 得是新 key，不然「热载」只是显示层面好看
+  await chat('ollama');
+  check('.env 改了 key：上游真的收到新 key', ol.auth === 'test-ol-brand-new-key', 'ollama 收到 Bearer ' + String(ol.auth).slice(0, 24));
+
+  // 手动触发一次（不想等那 15 秒轮询时用）。轮询器 200ms 一次，可能抢在前面，
+  // 所以判据放宽成「要么这次是你手动发现的，要么轮询已经替你做完了」。
+  fs.writeFileSync(ENVFILE, 'DEEPSEEK_API_KEY=test-ds\nOLLAMA_API_KEY=test-ol-manual-hit\n');
+  const manual = await (await fetch(BR + '/reload-env')).json();
+  const hitByManual = Array.isArray(manual.changed) && manual.changed.includes('ollama');
+  const hitByPoll = (await snap()).includes('尾号 -hit');
+  check(
+    '手动 /_router/reload-env 可用',
+    manual.ok === true && (hitByManual || hitByPoll),
+    'ok=' + manual.ok + ' changed=' + JSON.stringify(manual.changed) + ' 轮询已生效=' + hitByPoll,
+  );
+
+  // 文件没变时不该无脑重置熔断/缓存（否则每次都白查一遍余额）
+  const idle = await (await fetch(BR + '/reload-env')).json();
+  check('内容没变时手动重载不误报变化', idle.ok === true && idle.changed.length === 0, 'changed=' + JSON.stringify(idle.changed));
+
+  // 换回原来的 key，后面的用例不受影响
+  fs.writeFileSync(ENVFILE, 'DEEPSEEK_API_KEY=test-ds\nOLLAMA_API_KEY=test-ol\n');
+  await waitFor(async () => (await snap()).includes('ollamaKey=已配置(尾号 -ol)'), 4000);
+}
+
 // 7. 两家都挂时返回 503
 {
   await ol.fail(503, 5);

@@ -51,13 +51,14 @@
 | 推理档位 | 最近一次请求实际下发的 `thinking` 与 `reasoning_effort`，以及各档累计次数 |
 | 用了多少 / 花了多少 | 本次运行、今日、近 7 天、累计：请求数、输入 token（含缓存命中）、输出 token、人民币花费，以及**官方 / Ollama 各花了多少** |
 | 按上游 | 「今日 / 近 7 天 / 累计」三列 × 「DeepSeek 官方 / Ollama Cloud」两行：各自的请求数、token、花费（DSH 插件只能看到 `time-router:auto` 一行，上游拆分看这里） |
+| 上游健康 | 两家各自的熔断状态：正常 / 暂停中（第几次失败、失败原因、还有多久探活） |
 | 还剩多少钱 | DeepSeek 账户余额（¥）、Ollama 套餐剩余额度（$）与到期日 |
 
 带 `x-router-force` 的手动测试请求**单独计数**（看板上写「另有测试 N 次 ¥x」），
 不进 `requests`、不进 `byProvider`、也不进 `stats.json` 的历史——免得调试把账搅乱。
 
 原始 JSON：`/_router/status`（当前选择）、`/_router/stats`（用量与花费）、
-`/_router/balance`（余额）。
+`/_router/balance`（余额）、`/_router/breaker`（上游熔断状态）。
 
 这些数字按**北京日期**记进同目录的 `stats.json`，重启不清零，所以看板上的
 「今日 / 近 7 天 / 累计」是跨重启累计的；想清零就删掉这个文件再重启代理。
@@ -172,7 +173,7 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `schedule.mjs` | 纯时间规则，无网络依赖；`node schedule.mjs --test` 跑边界用例 |
 | `router.mjs` | 本地 OpenAI 兼容代理，按规则转发 + 失败回退 + 用量记账 |
 | `probe.mjs` | 两家 API 的兼容性冒烟测试（tools / 流式 / 缓存） |
-| `test-local.mjs` | 用假上游回归测试路由逻辑（35 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径/看板渲染/错误正文限时/余额并行/SIGTERM 落盘），不联网不花钱 |
+| `test-local.mjs` | 用假上游回归测试路由逻辑（42 项：路由/映射/回退/流式/gzip/护栏/客户端断开/记账口径/看板渲染/错误正文限时/余额并行/上游熔断/SIGTERM 落盘），不联网不花钱 |
 | `holidays.json` | 中国法定节假日表（这些天 DeepSeek 全天空闲，路由全天走官方）；已含 2027 全年，改后自动重载 |
 | `stats.json` | 按北京日期累计的用量账本，自动生成；删掉即清零 |
 | `setup.mjs` / `setup.cmd` | 一键部署：找回 key、验证、写 `.env`、装自启、启动、查 DSH 配置 |
@@ -187,7 +188,7 @@ reasoning_effort: unknown variant `bogus`, expected one of `none`, `minimal`, `l
 | `tools\test-log-rotate.mjs` | 日志轮转的回归测试（`node tools/test-log-rotate.mjs`，6 个断言，不联网、不碰 8788） |
 | `tools\test-sigterm-wrapper.mjs` | 测试用外壳：在进程内 `process.emit('SIGTERM')`，用来验「收到信号先把账本刷下去」（Windows 上 `child.kill('SIGTERM')` 是硬杀，handler 跑不到） |
 | `autostart\` | 计划任务 `Ollama-DS-Router` 的入口：`router-hidden.vbs` → `tools\supervisor.mjs`（守护：崩了 5 秒拉起、每 30 秒探活） |
-| `.env.example` | 全部 30 个环境变量的模板（必填只有两个 key） |
+| `.env.example` | 全部 34 个环境变量的模板（必填只有两个 key） |
 
 ## 一键部署（推荐）
 
@@ -260,7 +261,7 @@ node probe.mjs
 
 ```powershell
 node schedule.mjs --test        # 时间规则边界（13 项）
-node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 记账（35 项）
+node test-local.mjs             # 路由 / 映射 / 回退 / 流式 / 客户端断开 / 熔断 / 记账（42 项）
 node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 ```
 
@@ -345,6 +346,8 @@ node tools/test-log-rotate.mjs  # 守护进程的日志轮转（6 项）
 
 ## 行为细节
 
+- **熔断**：同一家连续 3 次「上游不健康」就暂停它、直接走另一家，每 3 分钟探活一次，
+  通了自动切回（详见下面「上游熔断」）。
 - **回退**：主线路返回 400/404/422（参数方言不被接受）、429/5xx、连不上、首字节超时
   （默认 60s，`ROUTER_FIRST_BYTE_TIMEOUT_MS`）、流中途超过 120s 没有新数据（`ROUTER_IDLE_TIMEOUT_MS`），
   自动换另一家重试；已经吐了字节就不再重试（避免半截输出，只记日志）。
@@ -436,6 +439,54 @@ DSH 里按 Esc 取消、关窗口、或者网络断了，代理会跟着把上�
 
 守护自己的日志（`autostart/router-supervisor.log`）和 router 的 stdout 是同一个文件；
 `router.log` 只记进程启动/退出这两行，别在它里面找请求记录。
+
+### 上游熔断：连续挂 3 次就先别用它（2026-11-27）
+
+Ollama 套餐额度用尽那天（2026-11-27 15:20 起）暴露了一个浪费：模式是「自动 · 以 DS 空闲为准」，
+DeepSeek 又正处高峰，于是**每一条**请求都先去 Ollama 白等约 2.5 秒、撞 429，再兜底回官方。
+15:20–16:30 累计 281 次 429，用户侧感受就是「怎么突然每条都慢两三秒」。
+
+现在给每家上游加了一个熔断器：
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `ROUTER_BREAKER_FAILS` | `3` | 连续几次「上游不健康」就暂停这家；`0` 关闭熔断 |
+| `ROUTER_BREAKER_PROBE_MS` | `180000`（3 分钟） | 熔断后每隔多久发一条探针试活 |
+| `ROUTER_BREAKER_PROBE_TIMEOUT_MS` | `20000` | 探针本身的超时 |
+| `ROUTER_BREAKER_TICK_MS` | `15000` | 多久扫一次有没有到点的探针（不用等于探针间隔） |
+
+三条规则：
+
+1. **连续 3 次不健康才熔断**。哪些算：5xx、429、401/403、超时（首字节/流中断）、连不上。
+   哪些不算：400 / 404 / 422（参数方言不对，换个请求就好）、413、上下文溢出
+   （那是这一个请求太长，不是这家坏了）、客户端主动取消（DSH 按 Esc）。把 400 算进去
+   会把整家误伤掉，而参数方言回退本来就是常态。
+2. **额度类错误一次就熔断**。HTTP 402，或 429 正文里带 `monthly usage limit` /
+   `add usage credits` / `insufficient balance` / `余额不足` 之类的文案 —— 余额没了，
+   再试两次只是白等两次。Ollama 当天的故障正好是这一种。
+3. **探针用真实请求，不看余额接口**。`POST {base}/chat/completions`，一条 `ping`、
+   `max_tokens: 1`、非流式。理由：Ollama 额度用尽时 `/api/balance` 照样返回 200，
+   只有真发一次推理才知道能不能用。探针花费单独记在 `stats.breaker.probeCny`，
+   不冒充用户请求、不进「省了多少」。通了就自动切回（下次请求立刻能用），
+   不通就把下次探活推后 3 分钟。
+
+熔断期间请求**不会**再打到这家：`choose()` 直接跳过（日志里带 `breakerSkip` 原因），
+所以「自动」模式下即便首选是死掉的那家，也不会多等那 2~3 秒。两家都熔断时才退回原来的
+「硬试」逻辑，最后照常 503。
+
+可观测性：
+
+- `GET /_router/breaker`：`{threshold, probeIntervalSec, opens, recoveries, last, upstreams:{deepseek:{open,fails,opens,reason,retryInSec,probing,lastProbe}, ollama:{…}}}`
+- `GET /_router/breaker/reset`（GET/POST 都行）：手动清空熔断状态。充值后不想等探针，或者
+  刚改完 key，用它比等 3 分钟快。
+- `/_router/status` 里带 `breaker`；`/_router/mode` 的文本快照里多四行
+  `breakerDeepseek=… / breakerOllama=… / breakerOpens=… / breakerRecoveries=…`（托盘读这个）。
+- 看板顶部多一张「上游健康（熔断）」卡片：正常时写「两家都正常」，暂停时写
+  「Ollama Cloud 已暂停（1 次失败：额度用尽…；2 分 40 秒后探活）」。
+- 日志三种标记：`⛔ … 暂停使用`、`⏻ … 探活仍失败（HTTP 429 …）`、`✓ … 已恢复使用（熔断持续 N 秒）`。
+
+回归用例在 `test-local.mjs` 的 6.97：「400 参数错误不计入熔断 / 连续 3 次 5xx 后熔断 /
+熔断期间跳过这家 / 探针成功后自动恢复 / 恢复后重新走这家 / 额度用尽一次即熔断 / 看板卡片」。
 
 ### 一次体检修掉的 9 个问题（2026-11-24）
 

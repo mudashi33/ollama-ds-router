@@ -29,6 +29,7 @@ function makeMock(name, port) {
   let calls = 0;
   let failsLeft = 0;
   let failStatus = 503;
+  let failMsg = null;
   let gzipNext = false;
   let abortNext = false;
   // 慢流：每 pieceMs 吐一块，共 pieces 块。用来验证「客户端断开要传播到上游」——
@@ -49,6 +50,7 @@ function makeMock(name, port) {
     if (url.pathname === '/_fail') {
       failStatus = Number(url.searchParams.get('status') || 503);
       failsLeft = Number(url.searchParams.get('count') || 1);
+      failMsg = url.searchParams.get('msg') || null;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ failStatus, failsLeft }));
       return;
@@ -157,7 +159,7 @@ function makeMock(name, port) {
     if (failsLeft > 0) {
       failsLeft -= 1;
       res.writeHead(failStatus, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: `${name} 故意返回 ${failStatus}` } }));
+      res.end(JSON.stringify({ error: { message: failMsg ? `${name} ${failMsg}` : `${name} 故意返回 ${failStatus}` } }));
       return;
     }
 
@@ -250,8 +252,10 @@ function makeMock(name, port) {
     get calls() {
       return calls;
     },
-    fail(status, count = 1) {
-      return fetch(`http://127.0.0.1:${port}/_fail?status=${status}&count=${count}`);
+    fail(status, count = 1, msg = null) {
+      const q = new URLSearchParams({ status: String(status), count: String(count) });
+      if (msg) q.set('msg', msg);
+      return fetch(`http://127.0.0.1:${port}/_fail?${q}`);
     },
     gzip() {
       return fetch(`http://127.0.0.1:${port}/_gzip`);
@@ -301,6 +305,9 @@ const router = spawn(process.execPath, ['router.mjs'], {
     // 余额缓存归零 + 单家超时 2 秒：「并行拉」那条用例才分得出来（并行约 2s，串行约 4s）
     ROUTER_BALANCE_TTL_MS: '0',
     ROUTER_BALANCE_TIMEOUT_MS: '2000',
+    // 熔断：探针 800ms 一次、扫描 200ms 一次，「恢复」那条用例才能在几秒内跑完
+    ROUTER_BREAKER_PROBE_MS: '800',
+    ROUTER_BREAKER_TICK_MS: '200',
     DEEPSEEK_BASE: 'http://127.0.0.1:9101',
     DEEPSEEK_API_KEY: 'test-ds',
     DEEPSEEK_MODEL: 'deepseek-flash',
@@ -751,6 +758,80 @@ async function chat(force, body = {}) {
   check('看板合计行把客户端断开降成灰字', ok, totalRow.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120));
 }
 
+
+// 6.97 熔断：连续失败 3 次就把这家踢出去，探针通了自动回来
+{
+  const BR = 'http://127.0.0.1:8799/_router';
+  const bstate = async () => (await fetch(BR + '/breaker')).json();
+  const breset = async () => (await fetch(BR + '/breaker/reset')).json();
+  const olCalls = () => ol.calls;
+
+  await breset();
+
+  // 400 是「参数方言不对」，换个请求就好，不该把整家算成不健康
+  await ol.fail(400, 3);
+  for (let i = 0; i < 3; i++) await chat('ollama');
+  const b400 = await bstate();
+  check(
+    '400 参数错误不计入熔断',
+    b400.upstreams.ollama.open === false && b400.upstreams.ollama.fails === 0,
+    'open=' + b400.upstreams.ollama.open + ' fails=' + b400.upstreams.ollama.fails,
+  );
+
+  // 连续 3 次 5xx → 熔断
+  await ol.fail(503, 3);
+  for (let i = 0; i < 3; i++) await chat('ollama');
+  const bOpen = await bstate();
+  check(
+    '连续 3 次 5xx 后熔断',
+    bOpen.upstreams.ollama.open === true && bOpen.opens >= 1,
+    'open=' + bOpen.upstreams.ollama.open + ' fails=' + bOpen.upstreams.ollama.fails + ' opens=' + bOpen.opens,
+  );
+
+  // 熔断期间即使请求指定 ollama，也不该再白等它一次
+  const before = olCalls();
+  const r = await chat('ollama');
+  const j = await r.json();
+  check(
+    '熔断期间跳过这家、直接走另一家',
+    j.server === 'ds' && olCalls() === before,
+    'server=' + j.server + ' ollama 调用 ' + before + '→' + olCalls(),
+  );
+
+  // 探针：假上游恢复健康后，下一次探活应该把它救回来
+  let back = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(200);
+    const now = await bstate();
+    if (!now.upstreams.ollama.open) {
+      back = now;
+      break;
+    }
+  }
+  check('探针成功后自动恢复', !!back && back.recoveries >= 1, back ? 'recoveries=' + back.recoveries + ' lastProbe=' + JSON.stringify(back.lastProbe || null) : '10 秒内没有恢复');
+
+  // 恢复后指定 ollama 又能真的走 ollama
+  const r2 = await chat('ollama');
+  const j2 = await r2.json();
+  check('恢复后重新走这家', j2.server === 'ol', 'server=' + j2.server);
+
+  // 额度用尽（429 + 套餐文案）：一次就该熔断，不用等满 3 次
+  await breset();
+  await ol.fail(429, 1, 'you (1) have reached your monthly usage limit, add usage credits');
+  await chat('ollama');
+  const bQuota = await bstate();
+  check(
+    '额度用尽一次即熔断',
+    bQuota.upstreams.ollama.open === true && bQuota.opens >= 1,
+    'open=' + bQuota.upstreams.ollama.open + ' fails=' + bQuota.upstreams.ollama.fails + ' reason=' + bQuota.upstreams.ollama.reason,
+  );
+
+  // 看板要能看到这块状态，否则用户只能猜为什么某家一直不被用
+  const html = await (await fetch(BR)).text();
+  check('看板显示上游健康卡片', html.includes('上游健康') && html.includes('熔断'), 'html 含「上游健康」=' + html.includes('上游健康'));
+
+  await breset();
+}
 
 // 6.96 落盘是 1.5 秒去抖的：进程被 SIGTERM 时必须先把脏数据刷下去，否则这一笔就丢了
 {

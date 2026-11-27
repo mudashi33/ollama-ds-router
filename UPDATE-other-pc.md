@@ -32,8 +32,9 @@
 
 2) 自检（三条全绿才能继续）
    node schedule.mjs --test       → 期望 13/13 PASS
-   node test-local.mjs            → 期望 35/35 PASS（旧版是 23/23，多了错误正文限时、看板转义、余额并行、
-                                    userRequests 口径、SIGTERM 落盘、drain 监听器、老版 completions 等用例）
+   node test-local.mjs            → 期望 42/42 PASS（旧版 23/23 → 35/35 → 42/42：多了上游熔断 7 条，
+                                    以及错误正文限时、看板转义、余额并行、userRequests 口径、SIGTERM 落盘、
+                                    drain 监听器、老版 completions 等用例）
    node tools/test-log-rotate.mjs → 期望 6/6 PASS（这个文件是新增的）
    任何一条失败：把完整报错贴给我，不要继续，也不要自己改测试。
 
@@ -79,12 +80,17 @@
    ROUTER_ERROR_BODY_TIMEOUT_MS=15000  # 读上游错误正文的上限（默认 15 秒）
    ROUTER_BALANCE_TIMEOUT_MS=3000    # 看板拉余额的单家超时（默认 3 秒）
    ROUTER_BALANCE_TTL_MS=60000       # 余额缓存多久（默认 60 秒）
+   ROUTER_BREAKER_FAILS=3            # 连续几次失败就暂停这家；=0 关闭熔断
+   ROUTER_BREAKER_PROBE_MS=180000    # 熔断后每隔多久探活一次（默认 3 分钟）
+   ROUTER_BREAKER_PROBE_TIMEOUT_MS=20000  # 探针本身的超时
+   ROUTER_BREAKER_TICK_MS=15000      # 多久扫一次到点的探针
    注意：改完 .env 要重做第 3 步的重启才生效。不要打印任何 key 的值。
 
 交付报告请包含：
 - 更新前后的 git 提交号（git log --oneline -1 各一次）
 - 三条测试的末尾 PASS 计数
-- /_router/status 的实际 HTTP 码、/_router/stats 里有没有 clientAborted
+- /_router/status 的实际 HTTP 码、/_router/stats 里有没有 clientAborted、breaker 段是否正常
+- /_router/breaker 的实际输出（两家 open=false 才算正常）
 - cordis.patch.yml 改了哪几行（只贴改动行）+ 备份文件名
 - DSH 重启后 /_router/stats 的数字变化
 - 任何一步失败：命令、原文报错、你怎么处理的
@@ -100,7 +106,8 @@
 | 客户端断开即中止上游 | 按 Esc 取消后上游立刻停，不再继续生成计费；这类请求记成「客户端断开」，不算失败 |
 | 失败进账本 | 看板/账本里的失败数不再永远是 0；口径固定为 `requests = ok + failed + clientAborted` |
 | 日志轮转 | 守护日志超过 5MB 或 7 天自动轮转（copytruncate，不再出现写满磁盘的老问题） |
-| 测试 23 项 → 35 项 | 新增错误正文限时、看板转义、余额并行、userRequests 口径、SIGTERM 落盘、drain 监听器、老版 completions 等用例 |
+| 上游熔断 | 某家连续失败 3 次（或一次「额度用尽」）就暂停它、直接走另一家，不再每条白等 2~3 秒；每 3 分钟发一条 1-token 探针，通了自动切回。看板多一张「上游健康」卡片，`GET /_router/breaker` 看状态、`/_router/breaker/reset` 手动清空 |
+| 测试 23 项 → 42 项 | 新增上游熔断（7 条）、错误正文限时、看板转义、余额并行、userRequests 口径、SIGTERM 落盘、drain 监听器、老版 completions 等用例 |
 | 修掉 9 个问题 | 错误正文不再挂死请求、护栏认 `max_completion_tokens` 与字符串、看板不再执行上游脚本、余额并行拉（最坏 16s → 3s）、看板次数改显示「用户问了几次」、退出不再丢最后一笔账 |
 | 账本字段 | 新增 `userRequests`（用户真正问了几次，不含兜底重试）；旧账本首次启动自动回填并升到 version 2 |
 | 看板合计行 | 「客户端断开 N」由红字改成灰色小字「断开 N」，真故障「失败 N」仍是红字 |

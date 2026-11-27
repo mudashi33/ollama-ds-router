@@ -1,5 +1,47 @@
 # 变更记录
 
+## 2026-11-27 — 上游熔断：连续挂 3 次先别用它，每 3 分钟探活一次
+
+### 起因
+Ollama 套餐额度在 2026-11-27 用尽（`included.balance_usd=0`）。当时模式是「自动 · 以 DS 空闲为准」，
+DeepSeek 正处高峰，于是**每条**请求都先去 Ollama 白等约 2.5 秒、撞 429，再兜底回官方；
+15:20 起累计 281 次 429，用户感受就是「突然每条都慢两三秒」。
+用户要求：连续失败多少次就强制切换，然后每隔 3–5 分钟访问一次失败的那家，成功了就切回去。
+
+### 做法
+- 每家上游一个熔断器（`router.mjs` 里 `breaker` 状态 + `markUpstreamFail/markUpstreamOk`）：
+  **连续 `ROUTER_BREAKER_FAILS`（默认 3）次「上游不健康」→ 暂停这家**，`choose()` 直接跳过，
+  不再白等；熔断期间请求立刻落到另一家（`breakerSkip` 标明原因）。
+- **额度类错误一次即熔断**：HTTP 402，或 429 正文命中 `monthly usage limit` / `add usage credits` /
+  `insufficient (balance|quota|credits|funds)` / `quota (exceeded|exhausted|reached)` /
+  `payment required` / `credit balance is too low` / `余额不足`。日志写「额度用尽 → 暂停使用」，
+  而不是伪装成「连续 3 次失败」。
+- **探活用真实 1-token 请求**（`POST {base}/chat/completions`，`ping` + `max_tokens:1`，非流式），
+  因为 Ollama 额度用尽时 `/api/balance` 照样 200 —— 只有真发一次推理才知道能不能用。
+  间隔 `ROUTER_BREAKER_PROBE_MS`（默认 180000 = 3 分钟），超时 `ROUTER_BREAKER_PROBE_TIMEOUT_MS`（20s），
+  扫描节奏 `ROUTER_BREAKER_TICK_MS`（15s，刻意与探针间隔解耦）。探针成功 → 自动恢复；
+  失败 → 把下次探活再推后 3 分钟，并写一行 `⏻ … 探活仍失败（HTTP 429 …）`。
+- **哪些失败不计入熔断**：400 / 404 / 422（参数方言，换个请求就好）、413、`overflow`
+  （上下文溢出是这一个请求太长，不是这家坏了）、`clientGone`（DSH 按 Esc）。
+  把 400 算进去会把整家误伤 —— 参数方言回退本来就是常态。
+- **可观测**：`GET /_router/breaker`（`{threshold, probeIntervalSec, opens, recoveries, last, upstreams:{…}}`）、
+  `GET|POST /_router/breaker/reset`（充值后不想等探针 / 测试用）、`/_router/status` 带 `breaker`、
+  `/_router/stats` 带 `breaker.probeRequests/probeCny`、`/_router/mode` 文本快照多 4 行
+  `breakerDeepseek/breakerOllama/breakerOpens/breakerRecoveries`（托盘读它）、看板顶部新卡片
+  「上游健康（熔断）」。日志三种标记：`⛔ 暂停使用` / `⏻ 探活仍失败` / `✓ 已恢复使用（熔断持续 N 秒）`。
+- 探针花费单独记 `stats.breaker.probeCny`，不冒充用户请求，也不进「省了多少」。
+
+### 测试
+`test-local.mjs` 35 → **42 项**，新增 6.97 一整段（7 条断言）：400 连试 3 次不熔断 /
+连 3 次 503 熔断 / 熔断期间请求不走那家（`ol.calls` 不增）/ 探针成功后自动恢复（`recoveries>=1`）/
+恢复后重新走那家 / 429+额度文案一次即熔断 / 看板有「上游健康」卡片。
+测试用 `ROUTER_BREAKER_PROBE_MS=800` + `ROUTER_BREAKER_TICK_MS=200` 把「3 分钟后探活」压到秒级。
+`node test-local.mjs` → **42/42 通过**。
+
+### 环境变量
+新增 4 个（`.env.example` 30 → 34 个，router 23 → 27 个）：`ROUTER_BREAKER_FAILS`、
+`ROUTER_BREAKER_PROBE_MS`、`ROUTER_BREAKER_PROBE_TIMEOUT_MS`、`ROUTER_BREAKER_TICK_MS`。
+
 ## 2026-11-24 — 体检修掉 9 个问题（错误正文限时 / 护栏双字段 / 看板转义 / 余额并行 / 用户请求数 / 落盘兜底）
 
 ### 为什么要体检

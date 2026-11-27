@@ -43,6 +43,13 @@ const cfg = {
   // 读上游错误正文（4xx/5xx 的 JSON）的上限。正常几百字节就结束，等这么久只是兜底：
   // 上游回了响应头却把正文挂住时，不能跟着它一起挂（客户端早就等不及了）。
   errorBodyTimeoutMs: Number(process.env.ROUTER_ERROR_BODY_TIMEOUT_MS || 15000),
+  // 上游熔断：同一家连续失败这么多次就先别用它了（=0 关闭）。额度用尽类错误一次即熔断。
+  breakerFails: Number(process.env.ROUTER_BREAKER_FAILS ?? 3),
+  // 熔断之后每隔这么久用一条 1-token 探针试活，通了立刻恢复（默认 3 分钟）
+  breakerProbeMs: Number(process.env.ROUTER_BREAKER_PROBE_MS || 180000),
+  breakerProbeTimeoutMs: Number(process.env.ROUTER_BREAKER_PROBE_TIMEOUT_MS || 20000),
+  // 多久扫一次「有没有到点的探针」。不用跟探针间隔一样：扫得勤一点，探针就能准时发。
+  breakerTickMs: Number(process.env.ROUTER_BREAKER_TICK_MS || 15000),
   bodyLimitBytes: 64 * 1024 * 1024,
   // 余额只是看板上的两张卡，宁可 2 秒拿不到显示「取不到」，也不能让整页跟着卡
   balanceTimeoutMs: Number(process.env.ROUTER_BALANCE_TIMEOUT_MS || 3000),
@@ -160,6 +167,8 @@ const stats = {
   lastEffort: null,
   // max_tokens 护栏：DSH 长会话会把 max_tokens 钳成 1（见 applyMaxTokensGuard 注释）
   maxTokensGuard: { hits: 0, last: null },
+  // 熔断：opens=暂停过几次，recoveries=探活救回来几次，probeRequests/probeCny=探针的账
+  breaker: { opens: 0, recoveries: 0, last: null, probeRequests: 0, probeCny: 0 },
 };
 
 // ------------------------------------------------------------------ 最近请求（环形缓冲）
@@ -555,6 +564,7 @@ function statsView() {
     effortNote: 'effort 取自请求体 reasoning_effort，thinking 取自 thinking.type，原样下发给上游',
     actualCny: Number(stats.actualCny.toFixed(6)),
     probeCny: Number(stats.probeCny.toFixed(6)),
+    breaker: { ...stats.breaker, probeCny: Number(stats.breaker.probeCny.toFixed(6)), state: breakerView() },
     fxUsdCny: FX_USD_CNY,
     tokens: {
       input: Object.values(stats.byProvider).reduce((n, s) => n + s.prompt, 0),
@@ -658,23 +668,252 @@ function available(id) {
   return Boolean(cfg.upstreams[id]?.key);
 }
 
+// ------------------------------------------------------------ 上游熔断
+//
+// 为什么需要：2026-11-27 Ollama 套餐额度用尽后，上游对每条请求都回
+//   429 {"error":{"message":"you (…) have reached your monthly usage limit …"}}
+// 而路由器只会「先打它一次，失败再兜底」，于是每条用户请求都白等 2~3 秒
+// （实测 15:20–16:30 之间 281 次，累计十几分钟），账本里也多出几百条失败。
+// 熔断器把「这家现在不能用」记在内存里：选择时直接跳过，然后按固定间隔发探针，
+// 探针通了就自动恢复——不需要人去托盘里手动切模式。
+//
+// 三态（标准 half-open）：
+//   closed  正常。连续失败到 ROUTER_BREAKER_FAILS 次 → open
+//   open    不再被 choose() 选中；每 ROUTER_BREAKER_PROBE_MS 发一条 1-token 探针
+//   探针成功 → closed（失败计数清零，重新按模式/时段选路）；探针失败 → 继续 open
+// 额度用尽的错误是确定性的（402，或带 quota/credits 字样的 429），一次就熔断，
+// 不必让用户陪着试满 3 次。
+//
+// 哪些失败算「这家不行」：网络层失败 / 首字节超时 / 5xx / 429 / 401·402·403 / 408·409·425。
+// 不算：400·404·422（参数方言问题，换个请求就好）、413、上下文溢出（是请求本身的错）、
+// 客户端断开（是我们这边客户走了，与上游无关）。把 400 也算进去会误伤整家：
+// 实测「换一家网关参数不被接受」是常态，那属于回退要解决的事，不是上游不健康。
+const BREAKER_FAILS = Number(process.env.ROUTER_BREAKER_FAILS ?? 3);
+const BREAKER_PROBE_MS = Number(process.env.ROUTER_BREAKER_PROBE_MS || 180000);
+const BREAKER_PROBE_TIMEOUT_MS = Number(process.env.ROUTER_BREAKER_PROBE_TIMEOUT_MS || 20000);
+const BREAKER_COUNT_STATUS = new Set([401, 402, 403, 408, 409, 425, 429, 500, 501, 502, 503, 504, 505, 529]);
+const QUOTA_PATTERNS = [
+  /monthly usage limit/i,
+  /insufficient (?:balance|quota|credits?|funds)/i,
+  /quota (?:exceeded|exhausted|reached)/i,
+  /add usage credits/i,
+  /payment required/i,
+  /credit balance is too low/i,
+  /余额不足/,
+];
+
+const breaker = Object.fromEntries(
+  Object.keys(cfg.upstreams).map((id) => [
+    id,
+    { open: false, fails: 0, opens: 0, openedAt: 0, nextProbeAt: 0, probing: false, lastReason: '', lastProbe: null },
+  ]),
+);
+
+function isQuotaExhausted(text) {
+  return QUOTA_PATTERNS.some((re) => re.test(String(text || '')));
+}
+
+/** 这次失败算不算「上游不健康」（true = 计入熔断） */
+function breakerCounts(result) {
+  if (!result || result.clientGone) return false;
+  if (result.overflow) return false;
+  if (typeof result.status === 'number') return BREAKER_COUNT_STATUS.has(result.status);
+  return true; // 网络层：连接失败 / 首字节超时 / 流在首字节前断
+}
+
+const humanSec = (ms) => {
+  const sec = Math.max(1, Math.round(ms / 1000));
+  return sec >= 60 ? `${Math.floor(sec / 60)} 分 ${sec % 60} 秒` : `${sec} 秒`;
+};
+
+function openBreaker(id, reason, { quota = false } = {}) {
+  const b = breaker[id];
+  if (!b || b.open) return;
+  b.open = true;
+  b.opens++;
+  b.openedAt = Date.now();
+  b.nextProbeAt = Date.now() + BREAKER_PROBE_MS;
+  b.lastReason = String(reason || '').slice(0, 200);
+  stats.breaker.opens++;
+  stats.breaker.last = { at: new Date().toISOString(), provider: id, action: 'open', reason: b.lastReason };
+  const how = quota ? '额度用尽' : `连续 ${b.fails} 次失败`;
+  log(
+    `⛔ ${cfg.upstreams[id].label} ${how} → 暂停使用（${b.lastReason}）；` +
+      `${humanSec(BREAKER_PROBE_MS)}后用一条 1-token 探针试活，通了自动恢复`,
+  );
+}
+
+function markUpstreamFail(id, result, note) {
+  const b = breaker[id];
+  if (!b || !(BREAKER_FAILS > 0) || b.open) return;
+  if (!breakerCounts(result)) return;
+  b.fails++;
+  b.lastReason = String(note || result?.reason || '').slice(0, 200);
+  const quota = typeof result?.status === 'number' && (result.status === 402 || isQuotaExhausted(result?.body ?? result?.reason));
+  if (quota) {
+    // 额度类不给「再试两次」的机会：余额没了，重试三次只是白等三次
+    openBreaker(id, `额度用尽：${b.lastReason}`, { quota: true });
+    return;
+  }
+  if (b.fails >= BREAKER_FAILS) openBreaker(id, b.lastReason);
+}
+
+function markUpstreamOk(id) {
+  const b = breaker[id];
+  if (!b) return;
+  const wasOpen = b.open;
+  b.fails = 0;
+  if (!wasOpen) return;
+  const downtime = b.openedAt ? Date.now() - b.openedAt : 0;
+  b.open = false;
+  b.nextProbeAt = 0;
+  b.lastReason = '';
+  stats.breaker.recoveries++;
+  stats.breaker.last = { at: new Date().toISOString(), provider: id, action: 'recover' };
+  log(`✓ ${cfg.upstreams[id].label} 已恢复使用（熔断持续 ${humanSec(downtime)}）`);
+}
+
+/**
+ * 探活：给熔断中的上游发一条最小的**真实**请求（1 条消息 + max_tokens=1）。
+ * 为什么不看余额接口：余额接口能不能通和能不能推理不是一回事——Ollama 额度用尽时
+ * /api/balance 照样 200，只有 /chat/completions 回 429。探针花费记在
+ * stats.breaker.probeCny 里，不冒充用户请求，也不算进「省了多少」。
+ */
+async function probeUpstream(id) {
+  const u = cfg.upstreams[id];
+  const t0 = Date.now();
+  const payload = JSON.stringify({ model: u.model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, stream: false });
+  try {
+    const r = await fetch(`${u.base}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${u.key}` },
+      body: payload,
+      signal: AbortSignal.timeout(BREAKER_PROBE_TIMEOUT_MS),
+    });
+    const text = await r.text();
+    const ms = Date.now() - t0;
+    if (!r.ok) return { ok: false, status: r.status, ms, text };
+    try {
+      const usage = normalizeUsage(JSON.parse(text)?.usage);
+      if (usage) {
+        const at = now();
+        const tier = id === 'deepseek' ? (isDeepSeekPeak(at) ? 'peak' : 'off') : (isOllamaPeak(at) ? 'peak' : 'off');
+        stats.breaker.probeRequests++;
+        stats.breaker.probeCny += costCny(id, tier, usage);
+      }
+    } catch {
+      /* 探针不解析 usage 也无所谓，能 200 就说明通了 */
+    }
+    return { ok: true, ms, text };
+  } catch (err) {
+    return { ok: false, ms: Date.now() - t0, text: String(err?.message || err) };
+  }
+}
+
+/** 每 15 秒看一次有没有到点的探针（探针本身有超时，不会堆起来） */
+async function breakerTick() {
+  for (const id of Object.keys(cfg.upstreams)) {
+    const b = breaker[id];
+    if (!b.open || b.probing || !available(id) || Date.now() < b.nextProbeAt) continue;
+    b.probing = true;
+    try {
+      const r = await probeUpstream(id);
+      b.lastProbe = { at: new Date().toISOString(), ok: r.ok, ms: r.ms, reason: r.ok ? '' : String(r.text || '').slice(0, 200) };
+      if (r.ok) {
+        markUpstreamOk(id);
+      } else {
+        b.nextProbeAt = Date.now() + BREAKER_PROBE_MS;
+        b.lastReason = `探活仍失败：${b.lastProbe.reason}`;
+        log(
+          `⏻ ${cfg.upstreams[id].label} 探活仍失败（${r.status ? `HTTP ${r.status} ` : ''}` +
+            `${String(r.text || '').slice(0, 80).replace(/\s+/g, ' ')}），${humanSec(BREAKER_PROBE_MS)}后再试`,
+        );
+      }
+    } finally {
+      b.probing = false;
+    }
+  }
+}
+
+/** 给 /_router/status 与托盘快照用的熔断视图 */
+function breakerView() {
+  const out = {};
+  for (const id of Object.keys(cfg.upstreams)) {
+    const b = breaker[id];
+    out[id] = {
+      open: b.open,
+      fails: b.fails,
+      opens: b.opens,
+      reason: b.lastReason || null,
+      retryInSec: b.open ? Math.max(0, Math.round((b.nextProbeAt - Date.now()) / 1000)) : 0,
+      probing: b.probing,
+      lastProbe: b.lastProbe,
+    };
+  }
+  return {
+    threshold: BREAKER_FAILS,
+    probeIntervalSec: Math.round(BREAKER_PROBE_MS / 1000),
+    opens: stats.breaker.opens,
+    recoveries: stats.breaker.recoveries,
+    last: stats.breaker.last,
+    upstreams: out,
+  };
+}
+
+/** 一行中文摘要（看板卡片与日志共用） */
+function breakerText() {
+  const bad = Object.keys(cfg.upstreams).filter((id) => breaker[id].open);
+  if (!bad.length) return { title: '两家都正常', sub: `连续失败 ${BREAKER_FAILS} 次才熔断；熔断后每 ${humanSec(BREAKER_PROBE_MS)}探活一次` };
+  const parts = bad.map((id) => {
+    const b = breaker[id];
+    return `${cfg.upstreams[id].label} 已暂停（${b.fails} 次失败：${b.lastReason.slice(0, 40)}；${b.probing ? '正在探活' : `${humanSec(b.nextProbeAt - Date.now())}后探活`}）`;
+  });
+  return { title: `${bad.length} 家暂停中`, sub: parts.join('；') };
+}
+
+function pickOther(id) {
+  return id === 'ollama' ? 'deepseek' : 'ollama';
+}
+
 function choose(force) {
+  // 熔断中的上游一律不选（除非另一家也没法用，那也只能回头硬试）
+  const usable = (id) => available(id) && !breaker[id]?.open;
   if (force && available(force)) {
+    if (!usable(force)) {
+      const other = pickOther(force);
+      if (usable(other)) {
+        return {
+          provider: other,
+          reason: `请求强制指定 ${cfg.upstreams[force].label}，但它正在熔断中，临时改用 ${cfg.upstreams[other].label}`,
+          forced: true,
+          mode,
+          breakerSkip: force,
+        };
+      }
+    }
     return { provider: force, reason: '请求强制指定', forced: true, mode };
   }
   const m = MODES[mode];
   if (m.kind === 'force') {
-    if (available(m.provider)) return { provider: m.provider, reason: `模式：${m.label}`, mode };
-    const other = m.provider === 'ollama' ? 'deepseek' : 'ollama';
-    if (available(other)) {
-      return { provider: other, reason: `模式：${m.label}，但 ${m.provider} 未配置 key，改用 ${other}`, mode };
+    if (!usable(m.provider) && usable(pickOther(m.provider))) {
+      const other = pickOther(m.provider);
+      const why = available(m.provider) ? '正在熔断中' : '未配置 key';
+      return { provider: other, reason: `模式：${m.label}，但 ${cfg.upstreams[m.provider].label} ${why}，改用 ${cfg.upstreams[other].label}`, mode, breakerSkip: m.provider };
     }
+    if (available(m.provider)) return { provider: m.provider, reason: `模式：${m.label}`, mode };
   }
   const p = pickProvider(now(), { preferIdle: m.kind === 'auto' ? m.preferIdle : 'deepseek' });
-  if (!available(p.provider)) {
-    const other = p.provider === 'ollama' ? 'deepseek' : 'ollama';
-    if (available(other)) {
-      return { ...p, provider: other, reason: `${p.reason}，但 ${p.provider} 未配置 key，改用 ${other}`, mode };
+  if (!usable(p.provider)) {
+    const other = pickOther(p.provider);
+    if (usable(other)) {
+      const why = available(p.provider) ? '正在熔断中' : '未配置 key';
+      return {
+        ...p,
+        provider: other,
+        reason: `${p.reason}，但 ${cfg.upstreams[p.provider].label} ${why}，改用 ${cfg.upstreams[other].label}`,
+        mode,
+        breakerSkip: p.provider,
+      };
     }
   }
   return { ...p, mode };
@@ -1006,6 +1245,7 @@ async function dashboardHtml() {
   // 上游的错误正文、模型名、余额错误串都是外部可控文本，直接拼进 HTML 会被当成标记。
   // 实测上游回 {"message":"<img src=x onerror=...>"} 时看板里 onerror 原样存活。
   // 这里统一转义，凡是往页面里插字符串的地方都过一遍。
+  const bt = breakerText();
   const esc = (s) =>
     String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const le = v.lastEffort;
@@ -1156,6 +1396,9 @@ async function dashboardHtml() {
       <span class="sub">${split({ byProvider: v.byProvider })}</span></div>
     <div class="card"><span class="lbl">本次运行 · token</span><b>${tok(v.tokens.input + v.tokens.output)}</b>
       <span class="sub">${tokLine(v.tokens)}</span></div>
+    <div class="card"><span class="lbl">上游健康（熔断）</span><b>${esc(bt.title)}</b>
+      <span class="sub">${esc(bt.sub)}</span>
+      <span class="sub">救回 ${v.breaker.recoveries} 次 · 探针 ${v.breaker.probeRequests} 次 ${money(v.breaker.probeCny)}</span></div>
   </div>
 
   <h2>还剩多少钱</h2>
@@ -1255,6 +1498,10 @@ async function modeSnapshot() {
     `ollamaPeak=${isOllamaPeak(at) ? 1 : 0}`,
     `ollamaPeakWindow=工作日 20:00–次日 02:00`,
     `nextSwitch=${next.text}`,
+    `breakerDeepseek=${breaker.deepseek.open ? `open(${breaker.deepseek.fails}次,${Math.max(0, Math.round((breaker.deepseek.nextProbeAt - Date.now()) / 1000))}s后探活)` : `ok(${breaker.deepseek.fails}次连续失败)`}`,
+    `breakerOllama=${breaker.ollama.open ? `open(${breaker.ollama.fails}次,${Math.max(0, Math.round((breaker.ollama.nextProbeAt - Date.now()) / 1000))}s后探活)` : `ok(${breaker.ollama.fails}次连续失败)`}`,
+    `breakerOpens=${stats.breaker.opens}`,
+    `breakerRecoveries=${stats.breaker.recoveries}`,
     `deepseekOk=${dsOk}`,
     `deepseekBalance=${dsText}`,
     `deepseekError=${dsOk ? '' : String(ds?.error || `HTTP ${ds?.status ?? '?'}`)}`,
@@ -1315,6 +1562,22 @@ async function handle(req, res) {
     return sendJson(res, 200, { ok: true, mode, label: MODES[mode].label, provider: p.provider, reason: p.reason, saved });
   }
 
+  // 熔断状态：托盘/脚本排障时想直接看「现在是哪家被暂停、还有多久探活」
+  if (url.pathname === '/_router/breaker') {
+    return sendJson(res, 200, breakerView());
+  }
+
+  // 手动清除熔断（充值后不想等那几分钟探针；或用脚本做测试）
+  if (url.pathname === '/_router/breaker/reset') {
+    const cleared = [];
+    for (const id of Object.keys(breaker)) {
+      if (breaker[id].open) cleared.push(id);
+      Object.assign(breaker[id], { open: false, fails: 0, nextProbeAt: 0, probing: false, lastReason: '', openedAt: 0 });
+    }
+    if (cleared.length) log(`熔断状态被手动清除：${cleared.join(', ')}`);
+    return sendJson(res, 200, { ok: true, cleared, breaker: breakerView() });
+  }
+
   if (url.pathname === '/_router/recent') {
     return sendJson(res, 200, { max: RECENT_MAX, count: recent.length, recent });
   }
@@ -1337,6 +1600,7 @@ async function handle(req, res) {
       upstreams: Object.fromEntries(
         Object.entries(cfg.upstreams).map(([id, u]) => [id, { label: u.label, base: u.base, model: u.model, hasKey: Boolean(u.key) }]),
       ),
+      breaker: breakerView(),
       usage: {
         requests: stats.requests,
         actualCny: Number(stats.actualCny.toFixed(6)),
@@ -1452,6 +1716,7 @@ async function handle(req, res) {
       return;
     }
     if (result.ok) {
+      markUpstreamOk(id);
       const usage = normalizeUsage(result.usage);
       const r = record({
         provider: id,
@@ -1487,6 +1752,7 @@ async function handle(req, res) {
       });
       return;
     }
+    markUpstreamFail(id, result);
     recordFailure({ provider: id, probe: decision.forced === true, first: isFirst });
     log(`✗ ${upstream.label}  ${result.reason}`);
     pushRecent({
@@ -1558,6 +1824,11 @@ server.listen(cfg.port, cfg.host, () => {
   console.log(`  当前选择  ${p.provider}  — ${p.reason}`);
   console.log(`  下次切换  ${next.text}`);
   console.log(`  节假日    ${getHolidays().length} 天（holidays.json）`);
+  console.log(
+    BREAKER_FAILS > 0
+      ? `  熔断      连续失败 ${BREAKER_FAILS} 次暂停一家；每 ${humanSec(BREAKER_PROBE_MS)}用 1-token 探针试活（ROUTER_BREAKER_* 可调，FAILS=0 关闭）`
+      : '  熔断      已关闭（ROUTER_BREAKER_FAILS=0）',
+  );
   for (const [id, u] of Object.entries(cfg.upstreams)) {
     console.log(`  ${u.label.padEnd(14)} ${u.base}  model=${u.model}  key=${u.key ? '已配置' : '未配置'}`);
   }
@@ -1566,6 +1837,13 @@ server.listen(cfg.port, cfg.host, () => {
   }
   console.log('');
 });
+
+// 熔断探活：15 秒扫一次，只有到点的才真发探针（探针自带超时，不会堆起来）。
+// unref 掉，别让它拖住进程退出。
+const breakerTimer = setInterval(() => {
+  breakerTick().catch((err) => log(`熔断探活异常：${err?.message || err}`));
+}, cfg.breakerTickMs);
+if (breakerTimer.unref) breakerTimer.unref();
 
 server.on('error', (err) => {
   console.error(`启动失败: ${err.message}`);
